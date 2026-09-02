@@ -1,0 +1,66 @@
+{
+  "name": "mnist-lenet5",
+  "seed": 17,
+  "dataset": {
+    "name": "mnist",
+    "prior_fraction": 0.8,
+    "split_seed": 17,
+    "number_classes": 10
+  },
+  "encoder": {
+    "name": "lenet5",
+    "feature_dimension": 84,
+    "width": 1,
+    "dropout": 0.0
+  },
+  "prior": {
+    "source": "a_trained",
+    "optimizer": "adamw",
+    "epochs": 20,
+    "batch_size": 512,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "calibration_fraction": 0.0,
+    "label_smoothing": 0.0,
+    "augmentation": "none",
+    "cutout_size": 0
+  },
+  "feature_map": {
+    "kind": "pca_whiten_bias",
+    "rank": 33,
+    "kappa": 0.1
+  },
+  "posterior": {
+    "steps": 240,
+    "checkpoint_every": 40,
+    "batch_size": 2048,
+    "learning_rates": [0.003],
+    "objectives": ["exact"],
+    "warmup_steps": 100,
+    "training_quadrature_order": 24,
+    "selection_quadrature_order": 64,
+    "selection_chunk_size": 512,
+    "seed": 27,
+    "gradient_clip_norm": 10.0
+  },
+  "confidence": {
+    "total_failure_probability": 0.05,
+    "pac_bayes_delta_each": 0.045,
+    "pac_bayes_family_count": 1,
+    "monte_carlo_delta": 0.005,
+    "direct_holdout_delta": 0.05
+  },
+  "certification": {
+    "monte_carlo_trials": 1000000,
+    "monte_carlo_chunk_size": 20000,
+    "monte_carlo_seed": 1000020,
+    "diagnostic_quadrature_order": 96,
+    "evaluate_test": true,
+    "direct_holdout": true
+  },
+  "numerics": {
+    "minimum_posterior_std": 0.0001,
+    "minimum_relative_singular_value": 1e-10
+  }
+}
+
