@@ -1,451 +1,282 @@
 #!/usr/bin/env python3
-"""Run one symmetric independent-score output-space PAC-Bayes experiment."""
+"""Run one multiclass canonical-lift PAC-Bayes experiment."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-import os
 from pathlib import Path
-import platform
-import subprocess
-import sys
 import time
 from typing import Any, Sequence
 
-import scipy
 import torch
-from torch import Tensor
 
-from output_space_pb.canonical import OutputCoordinates
-from output_space_pb.certification import (
-    clopper_pearson_upper,
-    fresh_iid_monte_carlo,
-    gauss_hermite_risk,
-    pac_bayes_certificate,
+from data import fit_A_only_input_transform, load_test_set, load_training_set, observation_independent_split
+from models import (
+    PriorModel, apply_feature_transform, extract_prior_outputs, feature_transform_report,
+    fit_feature_transform, load_upstream_feature_transform, make_backbone,
+    train_or_load_prior, validate_upstream_backbone,
 )
-from output_space_pb.config import ExperimentConfig, load_config, smoke_config
-from output_space_pb.data import (
-    fit_input_transform,
-    load_test_data,
-    load_training_data,
-    make_ab_split,
+from pac_bayes import (
+    clopper_pearson_upper, fresh_monte_carlo, gauss_hermite_risk,
+    observable_coordinates, optimize_posterior, pac_bayes_certificate,
 )
-from output_space_pb.encoders import available_encoders, build_encoder
-from output_space_pb.optimize import search_posterior, state_dict_sha256
-from output_space_pb.prior import (
-    DeterministicPrior,
-    extract_components,
-    fit_feature_map,
-    load_upstream_feature_map,
-    seed_everything,
-    tensor_sha256,
-    train_or_load_prior,
-    validate_upstream_encoder,
+from utils import (
+    choose_device, git_commit, json_ready, load_config, runtime_info, save_json,
+    set_deterministic, smoke_config, state_dict_sha256, tensor_sha256,
 )
-from output_space_pb.results import build_result, write_result
 
 
-ROOT = Path(__file__).resolve().parent
-PRESET_ROOT = ROOT / "configs"
+HERE = Path(__file__).resolve().parent
+PRESETS = HERE / "configs"
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--preset", choices=available_presets())
-    source.add_argument("--config", type=Path)
-    source.add_argument(
-        "--smoke",
-        action="store_true",
-        help="run the built-in small synthetic certificate check",
-    )
+    configuration = parser.add_mutually_exclusive_group(required=True)
+    configuration.add_argument("--preset", choices=sorted(path.stem for path in PRESETS.glob("*.json")))
+    configuration.add_argument("--config", type=Path)
+    configuration.add_argument("--smoke", action="store_true")
     parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output", type=Path, default=Path("result.json"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--prior-checkpoint", type=Path)
     parser.add_argument("--upstream-stats", type=Path)
     parser.add_argument("--encoder-weights", type=Path)
-    return parser
-
-
-def available_presets() -> tuple[str, ...]:
-    return tuple(path.stem for path in sorted(PRESET_ROOT.glob("*.json")))
-
-
-def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
-    if args.smoke:
-        return smoke_config()
-    if args.preset:
-        return load_config(PRESET_ROOT / f"{args.preset}.json")
-    return load_config(args.config)
-
-
-def resolve_device(name: str) -> torch.device:
-    if name == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    device = torch.device(name)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable")
-    if device.type == "mps" and not (
-        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    ):
-        raise RuntimeError("MPS was requested but is unavailable")
-    return device
-
-
-def configure_runtime(seed: int) -> None:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    seed_everything(seed)
-    torch.use_deterministic_algorithms(True)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.allow_tf32 = False
-    if hasattr(torch.backends, "cuda"):
-        torch.backends.cuda.matmul.allow_tf32 = False
+    return parser.parse_args(argv)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
-    config = resolve_config(args)
-    config.validate()
+
+    # 1. Parse arguments and load the scientific configuration.
     if args.workers < 0:
         raise ValueError("workers must be nonnegative")
-    device = resolve_device(args.device)
-    configure_runtime(config.seed)
-    data_root = args.data_root.resolve()
-    output = (
-        args.output.resolve()
-        if args.output is not None
-        else (ROOT / "results" / config.name / "result.json").resolve()
-    )
-    print(f"[setup] experiment={config.name} device={device} output={output}")
-
-    # Training data is the only dataset loaded before all certified choices freeze.
-    train = load_training_data(
-        config.dataset,
-        data_root,
-        download=args.download,
-        seed=config.seed,
-    )
-    split = make_ab_split(
-        train.labels.numel(),
-        config.dataset.prior_fraction,
-        config.dataset.split_seed,
-    )
-    print(f"[data] A={split.prior.numel()} B={split.posterior.numel()} split=index-only")
-
-    input_dimension = (
-        config.dataset.synthetic_input_dimension
-        if config.dataset.name == "synthetic"
-        else None
-    )
-    encoder = build_encoder(
-        config.encoder,
-        input_dimension=input_dimension,
-        weights_path=args.encoder_weights.resolve() if args.encoder_weights else None,
-    )
-    upstream_audit: dict[str, Any] | None = None
-    if config.prior.source == "upstream":
-        if args.upstream_stats is None:
-            raise ValueError("the upstream preset requires --upstream-stats")
-        feature_map, input_transform, upstream_audit = load_upstream_feature_map(
-            args.upstream_stats.resolve(), config.feature_map
-        )
-        validate_upstream_encoder(encoder, feature_map)
-        prior = DeterministicPrior(encoder, config.dataset.number_classes, zero_head=True)
+    if args.smoke:
+        config = smoke_config()
+    elif args.preset:
+        config = load_config(PRESETS / f"{args.preset}.json")
     else:
+        config = load_config(args.config)
+    device = choose_device(args.device)
+    set_deterministic(config["seed"])
+    data_root, output_path = args.data_root.resolve(), args.output.resolve()
+    print(f"[setup] {config['name']} on {device}")
+
+    # 2. Load only the training dataset. Test data is deliberately not loaded here.
+    train_images, train_labels = load_training_set(
+        config["dataset"], data_root, args.download, config["seed"]
+    )
+
+    # 3. Split indices into A and B without giving the split function any observations.
+    A_indices, B_indices = observation_independent_split(
+        train_labels.numel(), config["dataset"]["prior_fraction"], config["dataset"]["split_seed"]
+    )
+    print(f"[data] A={A_indices.numel()} B={B_indices.numel()} (index-only split)")
+
+    # 4. Train or load the deterministic prior. Every learned choice here uses A only.
+    backbone = make_backbone(
+        config["encoder"], config["dataset"].get("synthetic_input_dimension"),
+        args.encoder_weights.resolve() if args.encoder_weights else None,
+    )
+    upstream_audit = None
+    if config["prior"]["source"] == "a_trained":
         if args.upstream_stats is not None:
-            raise ValueError("--upstream-stats is valid only for an upstream prior")
-        input_transform = fit_input_transform(train, split.prior)
-        prior = DeterministicPrior(encoder, config.dataset.number_classes, zero_head=False)
-
-    prior_result = train_or_load_prior(
-        prior,
-        train,
-        split.prior,
-        input_transform,
-        config.prior,
-        device=device,
-        workers=args.workers,
-        seed=config.seed,
-        checkpoint=args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
-    )
-    prior.freeze()
-    print(
-        f"[prior] selected_epoch={prior_result.selected_epoch} "
-        f"state={prior_result.state_sha256[:12]}"
-    )
-
-    if config.prior.source != "upstream":
-        extracted_A = extract_components(
-            prior,
-            train,
-            split.prior,
-            input_transform,
-            batch_size=max(config.prior.batch_size, 256),
-            device=device,
-            workers=args.workers,
+            raise ValueError("--upstream-stats is only valid for the transfer preset")
+        input_transform = fit_A_only_input_transform(
+            train_images, A_indices, config["dataset"]["name"]
         )
-        feature_map = fit_feature_map(extracted_A.raw_features, config.feature_map)
+        prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=False)
+    else:
+        if args.upstream_stats is None:
+            raise ValueError("the transfer preset requires --upstream-stats")
+        if args.prior_checkpoint is not None:
+            raise ValueError("the transfer preset does not use --prior-checkpoint")
+        feature_transform, input_transform, upstream_audit = load_upstream_feature_transform(
+            args.upstream_stats.resolve(), config["feature_map"]
+        )
+        validate_upstream_backbone(backbone, feature_transform)
+        prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=True)
 
-    extracted_B = extract_components(
-        prior,
-        train,
-        split.posterior,
-        input_transform,
-        batch_size=max(config.prior.batch_size, 256),
-        device=device,
-        workers=args.workers,
+    prior_metrics = train_or_load_prior(
+        prior, train_images, train_labels, A_indices, input_transform, config["prior"],
+        device, args.workers, config["seed"],
+        args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
     )
-    features_B = feature_map.transform(extracted_B.raw_features)
-    base_B = extracted_B.base_scores.to(torch.float64)
-    labels_B = extracted_B.labels.to(torch.long)
-    coordinates = OutputCoordinates.from_features(
-        features_B,
-        minimum_relative_singular_value=config.numerics.minimum_relative_singular_value,
+    print(f"[prior] epoch={prior_metrics['selected_epoch']} training_gpus={prior_metrics['training_gpu_count']}")
+
+    # 5. Fit the stochastic feature transformation using A only.
+    if config["prior"]["source"] == "a_trained":
+        raw_A, _, _ = extract_prior_outputs(
+            prior, train_images, train_labels, A_indices, input_transform,
+            max(config["prior"]["batch_size"], 256), device, args.workers,
+        )
+        feature_transform = fit_feature_transform(raw_A, config["feature_map"])
+
+    # 6. Freeze the prior, then extract frozen base scores and stochastic features.
+    prior.freeze()
+    if any(parameter.requires_grad for parameter in prior.parameters()):
+        raise RuntimeError("the prior was not frozen")
+    raw_B, base_scores_B, labels_B = extract_prior_outputs(
+        prior, train_images, train_labels, B_indices, input_transform,
+        max(config["prior"]["batch_size"], 256), device, args.workers,
     )
-    if coordinates.observed_rank != config.feature_map.rank:
-        raise RuntimeError("observable B rank differs from the predeclared feature rank")
+    features_B = apply_feature_transform(raw_B, feature_transform)
+
+    # 7. Compute B's observable coordinates, retaining every nonzero SVD direction.
+    coordinates = observable_coordinates(
+        features_B, config["numerics"]["minimum_relative_singular_value"]
+    )
+    if coordinates["observed_rank"] != config["feature_map"]["rank"]:
+        raise RuntimeError("observable B rank differs from the declared feature rank")
     print(
-        f"[support] rank={coordinates.observed_rank}/{coordinates.latent_dimension} "
-        f"condition={coordinates.condition_number:.6g}"
+        f"[support] rank={coordinates['observed_rank']}/{coordinates['latent_dimension']} "
+        f"condition={coordinates['condition_number']:.6g} discarded=0"
     )
 
-    search = search_posterior(
-        config.posterior,
-        coordinates,
-        features_B,
-        base_B,
-        labels_B,
-        number_classes=config.dataset.number_classes,
-        minimum_std=config.numerics.minimum_posterior_std,
-        delta=config.confidence.pac_bayes_delta_each,
-        train_device=device,
+    # 8. Optimize and select the posterior using B only (Q=P remains a candidate).
+    posterior, selected, q_equals_p, states_evaluated = optimize_posterior(
+        config["posterior"], coordinates, features_B, base_scores_B, labels_B,
+        config["dataset"]["number_classes"], config["numerics"]["minimum_posterior_std"],
+        config["confidence"]["pac_bayes_delta_each"], device,
     )
-    posterior = search.posterior
-    frozen_hash = state_dict_sha256(posterior.state_dict())
-    if frozen_hash != search.state_sha256:
-        raise RuntimeError("selected posterior hash changed before certification")
-    pair = posterior.kl_pair()
-    raw_kl = float(pair.raw)
-    output_kl = float(pair.output)
+
+    # 9. Freeze the selected posterior before any reported KL or certification draw.
+    posterior.freeze()
+    frozen_posterior_hash = state_dict_sha256(posterior.state_dict())
+    if any(parameter.requires_grad for parameter in posterior.parameters()):
+        raise RuntimeError("the selected posterior was not frozen")
+
+    # 10. Compute raw and quotient KL from that exact same frozen posterior law.
+    raw_kl_tensor, quotient_kl_tensor = posterior.kl_values()
+    raw_kl_value, quotient_kl_value = float(raw_kl_tensor), float(quotient_kl_tensor)
+    if frozen_posterior_hash != state_dict_sha256(posterior.state_dict()):
+        raise RuntimeError("posterior state changed between raw and quotient KL")
     print(
-        f"[posterior] candidate={search.selected.candidate} step={search.selected.step} "
-        f"raw_kl={raw_kl:.8g} output_kl={output_kl:.8g}"
+        f"[posterior] {selected['candidate']} step={selected['step']} "
+        f"raw_kl={raw_kl_value:.8g} quotient_kl={quotient_kl_value:.8g}"
     )
 
-    direct_metrics: dict[str, Any] | None = None
-    if config.certification.direct_holdout and config.prior.source == "a_trained":
-        direct_errors = int(torch.count_nonzero(base_B.argmax(1) != labels_B))
-        direct_metrics = {
-            "errors": direct_errors,
-            "sample_size": labels_B.numel(),
-            "observed_error": direct_errors / labels_B.numel(),
-            "delta": config.confidence.direct_holdout_delta,
-            "upper": clopper_pearson_upper(
-                direct_errors,
-                labels_B.numel(),
-                config.confidence.direct_holdout_delta,
-            ),
+    direct_holdout = None
+    if config["certification"]["direct_holdout"] and config["prior"]["source"] == "a_trained":
+        errors = int(torch.count_nonzero(base_scores_B.argmax(1) != labels_B))
+        direct_holdout = {
+            "errors": errors, "sample_size": labels_B.numel(), "observed_error": errors / labels_B.numel(),
+            "delta": config["confidence"]["direct_holdout_delta"],
+            "upper": clopper_pearson_upper(errors, labels_B.numel(), config["confidence"]["direct_holdout_delta"]),
             "confidence_statement_is_separate": True,
         }
 
-    # A new generator is created only here, after selection and posterior hashing.
-    monte_carlo = fresh_iid_monte_carlo(
-        posterior,
-        features_B,
-        base_B,
-        labels_B,
-        trials=config.certification.monte_carlo_trials,
-        chunk_size=config.certification.monte_carlo_chunk_size,
-        seed=config.certification.monte_carlo_seed,
-        delta=config.confidence.monte_carlo_delta,
+    # 11. Use a new, separately seeded stream for post-selection Monte Carlo.
+    fresh_mc = fresh_monte_carlo(
+        posterior, features_B, base_scores_B, labels_B,
+        config["certification"]["monte_carlo_trials"],
+        config["certification"]["monte_carlo_chunk_size"],
+        config["certification"]["monte_carlo_seed"],
+        config["confidence"]["monte_carlo_delta"],
     )
-    certificate = pac_bayes_certificate(
-        monte_carlo.clopper_pearson_upper,
-        output_kl,
-        labels_B.numel(),
-        config.confidence.pac_bayes_delta_each,
-    )
-    if state_dict_sha256(posterior.state_dict()) != frozen_hash:
+    if state_dict_sha256(posterior.state_dict()) != frozen_posterior_hash:
         raise RuntimeError("posterior changed during final Monte Carlo")
+
+    # 12. Combine the conservative MC endpoint with the quotient KL certificate.
+    certificate = pac_bayes_certificate(
+        fresh_mc["clopper_pearson_upper"], quotient_kl_value, labels_B.numel(),
+        config["confidence"]["pac_bayes_delta_each"],
+    )
+    certificate.update({
+        "n_B": labels_B.numel(),
+        "pac_bayes_delta_each": config["confidence"]["pac_bayes_delta_each"],
+        "pac_bayes_family_count": config["confidence"]["pac_bayes_family_count"],
+        "monte_carlo_delta": config["confidence"]["monte_carlo_delta"],
+        "joint_failure_allocation": (
+            config["confidence"]["pac_bayes_delta_each"] * config["confidence"]["pac_bayes_family_count"]
+            + config["confidence"]["monte_carlo_delta"]
+        ),
+        "selection_preceded_final_mc": True,
+    })
     print(
-        f"[certificate] observed={100*monte_carlo.observed_risk:.6f}% "
-        f"CP={100*monte_carlo.clopper_pearson_upper:.6f}% "
-        f"bound={100*certificate.upper:.6f}%"
+        f"[certificate] MC={100*fresh_mc['observed_risk']:.4f}% "
+        f"CP={100*fresh_mc['clopper_pearson_upper']:.4f}% "
+        f"bound={100*certificate['population_gibbs_risk_upper']:.4f}%"
     )
 
-    # Test data is deliberately inaccessible to every choice above this point.
-    diagnostic_metrics: dict[str, Any] = {
-        "test_role": "diagnostic_only",
-        "test_loaded_after_certificate": False,
-    }
-    if config.certification.evaluate_test:
-        test = load_test_data(
-            config.dataset,
-            data_root,
-            download=args.download,
-            seed=config.seed,
+    # 13. Only now load and evaluate the test set; these values are diagnostic only.
+    diagnostics: dict[str, Any] = {"test_role": "diagnostic_only", "test_loaded_after_certificate": False}
+    if config["certification"]["evaluate_test"]:
+        test_images, test_labels = load_test_set(config["dataset"], data_root, args.download, config["seed"])
+        test_indices = torch.arange(test_labels.numel(), dtype=torch.long)
+        raw_test, base_scores_test, labels_test = extract_prior_outputs(
+            prior, test_images, test_labels, test_indices, input_transform,
+            max(config["prior"]["batch_size"], 256), device, args.workers,
         )
-        test_indices = torch.arange(test.labels.numel(), dtype=torch.long)
-        extracted_test = extract_components(
-            prior,
-            test,
-            test_indices,
-            input_transform,
-            batch_size=max(config.prior.batch_size, 256),
-            device=device,
-            workers=args.workers,
-        )
-        features_test = feature_map.transform(extracted_test.raw_features)
-        test_base = extracted_test.base_scores.to(torch.float64)
-        test_labels = extracted_test.labels.to(torch.long)
+        features_test = apply_feature_transform(raw_test, feature_transform)
         test_risk = gauss_hermite_risk(
-            posterior,
-            features_test,
-            test_base,
-            test_labels,
-            order=config.certification.diagnostic_quadrature_order,
-            chunk_size=config.posterior.selection_chunk_size,
+            posterior, features_test, base_scores_test, labels_test,
+            config["certification"]["diagnostic_quadrature_order"],
+            config["posterior"]["selection_chunk_size"],
         )
-        means, _ = posterior.score_statistics(features_test, test_base)
-        diagnostic_metrics.update(
-            {
-                "test_loaded_after_certificate": True,
-                "test_size": test_labels.numel(),
-                "test_gibbs_risk_gauss_hermite": test_risk,
-                "test_mean_argmax_error": float(
-                    (means.argmax(1) != test_labels).to(torch.float64).mean()
-                ),
-            }
-        )
-    if state_dict_sha256(posterior.state_dict()) != frozen_hash:
-        raise RuntimeError("posterior changed during diagnostic evaluation")
+        mean_test_scores, _ = posterior.score_statistics(features_test, base_scores_test)
+        diagnostics.update({
+            "test_loaded_after_certificate": True, "test_size": labels_test.numel(),
+            "test_gibbs_risk_gauss_hermite": test_risk,
+            "test_mean_argmax_error": float((mean_test_scores.argmax(1) != labels_test).to(torch.float64).mean()),
+        })
+    if state_dict_sha256(posterior.state_dict()) != frozen_posterior_hash:
+        raise RuntimeError("posterior changed during diagnostic test evaluation")
 
+    # 14. Save exactly one compact JSON result.
     metrics = {
         "status": "certified",
         "data": {
-            "dataset": config.dataset.name,
-            "training_size": train.labels.numel(),
-            "A_size": split.prior.numel(),
-            "B_size": split.posterior.numel(),
-            "A_index_sha256": tensor_sha256(split.prior),
-            "B_index_sha256": tensor_sha256(split.posterior),
+            "dataset": config["dataset"]["name"], "training_size": train_labels.numel(),
+            "A_size": A_indices.numel(), "B_size": B_indices.numel(),
+            "A_index_sha256": tensor_sha256(A_indices), "B_index_sha256": tensor_sha256(B_indices),
             "observation_independent_unstratified_split": True,
         },
         "prior": {
-            **asdict(prior_result),
-            "input_transform": asdict(input_transform),
-            "feature_map": feature_map.audit(),
-            "direct_holdout": direct_metrics,
-            "upstream": upstream_audit,
+            **prior_metrics, "input_transform": input_transform,
+            "feature_transform": feature_transform_report(feature_transform),
+            "direct_holdout": direct_holdout, "upstream": upstream_audit,
         },
-        "support": coordinates.audit(),
+        "support": {key: value for key, value in coordinates.items() if key not in {"right_basis", "singular_values"}},
         "posterior": {
-            "candidate": search.selected.candidate,
-            "objective": search.selected.objective,
-            "learning_rate": search.selected.learning_rate,
-            "step": search.selected.step,
-            "B_gauss_hermite_risk": search.selected.B_gauss_hermite_risk,
-            "selection_upper": search.selected.selection_upper,
-            "mean_l2": search.selected.mean_l2,
-            "std_min": search.selected.std_min,
-            "std_max": search.selected.std_max,
-            "q_equals_p_B_gauss_hermite_risk": search.q_equals_p.B_gauss_hermite_risk,
-            "q_equals_p_selection_upper": search.q_equals_p.selection_upper,
-            "candidate_states_evaluated": search.candidate_states_evaluated,
-            "state_sha256": frozen_hash,
+            **selected,
+            "q_equals_p_B_gauss_hermite_risk": q_equals_p["B_gauss_hermite_risk"],
+            "q_equals_p_selection_upper": q_equals_p["selection_upper"],
+            "candidate_states_evaluated": states_evaluated, "state_sha256": frozen_posterior_hash,
         },
         "kl": {
-            "raw_nats": raw_kl,
-            "output_nats": output_kl,
-            "same_posterior_state_sha256": frozen_hash,
+            "raw_nats": raw_kl_value, "quotient_nats": quotient_kl_value,
+            "same_posterior_state_sha256": frozen_posterior_hash,
         },
-        "fresh_mc": asdict(monte_carlo),
-        "certificate": {
-            "n_B": labels_B.numel(),
-            "pac_bayes_delta_each": config.confidence.pac_bayes_delta_each,
-            "pac_bayes_family_count": config.confidence.pac_bayes_family_count,
-            "pac_bayes_union_total": (
-                config.confidence.pac_bayes_delta_each
-                * config.confidence.pac_bayes_family_count
-            ),
-            "monte_carlo_delta": config.confidence.monte_carlo_delta,
-            "joint_failure_allocation": (
-                config.confidence.pac_bayes_delta_each
-                * config.confidence.pac_bayes_family_count
-                + config.confidence.monte_carlo_delta
-            ),
-            "binary_kl_budget": certificate.budget,
-            "population_gibbs_risk_upper": certificate.upper,
-            "selection_preceded_final_mc": True,
-        },
-        "diagnostics": diagnostic_metrics,
+        "fresh_mc": fresh_mc, "certificate": certificate, "diagnostics": diagnostics,
         "elapsed_seconds": time.perf_counter() - started,
     }
-    result = build_result(
-        config,
-        git_commit=git_commit(ROOT),
-        runtime=runtime_metadata(device),
-        resolved_paths={
-            "data_root": str(data_root),
-            "output": str(output),
-            "upstream_stats": str(args.upstream_stats.resolve()) if args.upstream_stats else None,
-            "encoder_weights": str(args.encoder_weights.resolve()) if args.encoder_weights else None,
-            "prior_checkpoint": str(args.prior_checkpoint.resolve()) if args.prior_checkpoint else None,
+    result = {
+        "config": {
+            "scientific": config, "runtime": runtime_info(device), "git_commit": git_commit(HERE),
+            "paths": {
+                "data_root": str(data_root), "output": str(output_path),
+                "prior_checkpoint": str(args.prior_checkpoint.resolve()) if args.prior_checkpoint else None,
+                "upstream_stats": str(args.upstream_stats.resolve()) if args.upstream_stats else None,
+                "encoder_weights": str(args.encoder_weights.resolve()) if args.encoder_weights else None,
+            },
         },
-        metrics=metrics,
-    )
-    write_result(output, result)
-    print(f"[done] wrote {output}")
+        "metrics": metrics,
+        "report": (
+            f"{config['name']}: certified Gibbs-risk upper bound "
+            f"{100*certificate['population_gibbs_risk_upper']:.4f}% "
+            f"(n_B={labels_B.numel()}, quotient KL={quotient_kl_value:.6g} nats)."
+        ),
+    }
+    save_json(output_path, json_ready(result))
+    print(f"[done] wrote {output_path}")
     return result
 
 
-def runtime_metadata(device: torch.device) -> dict[str, Any]:
-    return {
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "scipy": scipy.__version__,
-        "platform": platform.platform(),
-        "device": str(device),
-        "device_name": (
-            torch.cuda.get_device_name(device)
-            if device.type == "cuda"
-            else "Apple MPS"
-            if device.type == "mps"
-            else platform.processor() or "CPU"
-        ),
-        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-    }
-
-
-def git_commit(root: Path) -> str:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "uncommitted"
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    try:
-        run(args)
-    except Exception as error:
-        print(f"[failed] {type(error).__name__}: {error}", file=sys.stderr)
-        raise
+    run(parse_arguments(argv))
     return 0
 
 

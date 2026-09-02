@@ -13,7 +13,5 @@ dependencies = [
   "torchvision>=0.16",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["output_space_pb*"]
-
+[tool.setuptools]
+py-modules = ["data", "models", "pac_bayes", "utils"]
