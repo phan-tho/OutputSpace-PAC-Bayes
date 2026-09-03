@@ -1,10 +1,8 @@
 {
   "name": "mnist-cnn32",
-  "seed": 7,
   "dataset": {
     "name": "mnist",
     "prior_fraction": 0.8,
-    "split_seed": 7,
     "number_classes": 10
   },
   "encoder": {
@@ -40,7 +38,6 @@
     "training_quadrature_order": 32,
     "selection_quadrature_order": 64,
     "selection_chunk_size": 512,
-    "seed": 17,
     "gradient_clip_norm": 10.0
   },
   "confidence": {
@@ -53,7 +50,6 @@
   "certification": {
     "monte_carlo_trials": 1000000,
     "monte_carlo_chunk_size": 20000,
-    "monte_carlo_seed": 100010,
     "diagnostic_quadrature_order": 96,
     "evaluate_test": true,
     "direct_holdout": true
@@ -63,4 +59,3 @@
     "minimum_relative_singular_value": 1e-10
   }
 }
-

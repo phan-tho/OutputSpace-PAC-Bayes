@@ -21,7 +21,6 @@ from torch import Tensor
 
 TOP_LEVEL_FIELDS = {
     "name",
-    "seed",
     "dataset",
     "encoder",
     "prior",
@@ -34,7 +33,7 @@ TOP_LEVEL_FIELDS = {
 
 SECTION_FIELDS = {
     "dataset": {
-        "name", "prior_fraction", "split_seed", "number_classes",
+        "name", "prior_fraction", "number_classes",
         "synthetic_train_size", "synthetic_test_size", "synthetic_input_dimension",
     },
     "encoder": {"name", "feature_dimension", "width", "dropout"},
@@ -47,14 +46,14 @@ SECTION_FIELDS = {
     "posterior": {
         "steps", "checkpoint_every", "batch_size", "learning_rates", "objectives",
         "warmup_steps", "training_quadrature_order", "selection_quadrature_order",
-        "selection_chunk_size", "seed", "gradient_clip_norm",
+        "selection_chunk_size", "gradient_clip_norm",
     },
     "confidence": {
         "total_failure_probability", "pac_bayes_delta_each",
         "pac_bayes_family_count", "monte_carlo_delta", "direct_holdout_delta",
     },
     "certification": {
-        "monte_carlo_trials", "monte_carlo_chunk_size", "monte_carlo_seed",
+        "monte_carlo_trials", "monte_carlo_chunk_size",
         "diagnostic_quadrature_order", "evaluate_test", "direct_holdout",
     },
     "numerics": {"minimum_posterior_std", "minimum_relative_singular_value"},
@@ -150,10 +149,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("PAC-Bayes family plus MC allocation exceeds total failure")
     if min(certification["monte_carlo_trials"], certification["monte_carlo_chunk_size"]) <= 0:
         raise ValueError("Monte Carlo counts must be positive")
-    if certification["monte_carlo_seed"] in {
-        config["seed"], dataset["split_seed"], posterior["seed"]
-    }:
-        raise ValueError("final Monte Carlo seed must differ from training and split seeds")
     if not 0.0 < numerics["minimum_posterior_std"] < 1.0:
         raise ValueError("minimum posterior standard deviation must lie in (0,1)")
     if not 0.0 <= numerics["minimum_relative_singular_value"] < 1.0:
@@ -163,9 +158,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
 def smoke_config() -> dict[str, Any]:
     config = {
         "name": "synthetic-smoke",
-        "seed": 41,
         "dataset": {
-            "name": "synthetic", "prior_fraction": 0.75, "split_seed": 43,
+            "name": "synthetic", "prior_fraction": 0.75,
             "number_classes": 4, "synthetic_train_size": 128,
             "synthetic_test_size": 64, "synthetic_input_dimension": 12,
         },
@@ -182,7 +176,7 @@ def smoke_config() -> dict[str, Any]:
             "steps": 3, "checkpoint_every": 1, "batch_size": 32,
             "learning_rates": [0.01], "objectives": ["exact"], "warmup_steps": 1,
             "training_quadrature_order": 8, "selection_quadrature_order": 12,
-            "selection_chunk_size": 32, "seed": 47, "gradient_clip_norm": 10.0,
+            "selection_chunk_size": 32, "gradient_clip_norm": 10.0,
         },
         "confidence": {
             "total_failure_probability": 0.05, "pac_bayes_delta_each": 0.045,
@@ -191,7 +185,7 @@ def smoke_config() -> dict[str, Any]:
         },
         "certification": {
             "monte_carlo_trials": 4000, "monte_carlo_chunk_size": 1000,
-            "monte_carlo_seed": 100047, "diagnostic_quadrature_order": 16,
+            "diagnostic_quadrature_order": 16,
             "evaluate_test": True, "direct_holdout": True,
         },
         "numerics": {

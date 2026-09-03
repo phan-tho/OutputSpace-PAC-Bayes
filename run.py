@@ -12,12 +12,13 @@ import torch
 
 from data import fit_A_only_input_transform, load_test_set, load_training_set, observation_independent_split
 from models import (
+    CanonicalPosterior,
     PriorModel, apply_feature_transform, extract_prior_outputs, feature_transform_report,
     fit_feature_transform, load_upstream_feature_transform, make_backbone,
     train_or_load_prior, validate_upstream_backbone,
 )
 from pac_bayes import (
-    clopper_pearson_upper, fresh_monte_carlo, gauss_hermite_risk,
+    fresh_monte_carlo, gauss_hermite_risk,
     observable_coordinates, optimize_posterior, pac_bayes_certificate,
 )
 from utils import (
@@ -38,6 +39,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     configuration.add_argument("--smoke", action="store_true")
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("result.json"))
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--download", action="store_true")
@@ -59,6 +61,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         config = load_config(PRESETS / f"{args.preset}.json")
     else:
         config = load_config(args.config)
+    if args.seed < 0:
+        raise ValueError("--seed must be nonnegative")
+    config["seed"] = args.seed
+    config["dataset"]["split_seed"] = args.seed
+    config["posterior"]["seed"] = args.seed + 10_000
+    config["certification"]["monte_carlo_seed"] = args.seed + 20_000
     device = choose_device(args.device)
     set_deterministic(config["seed"])
     data_root, output_path = args.data_root.resolve(), args.output.resolve()
@@ -160,11 +168,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     direct_holdout = None
     if config["certification"]["direct_holdout"] and config["prior"]["source"] == "a_trained":
-        errors = int(torch.count_nonzero(base_scores_B.argmax(1) != labels_B))
+        # Q=P is the stochastic prior. MC bounds its empirical Gibbs risk on B;
+        # a zero-KL PAC-Bayes step then adds concentration from B to population.
+        direct_total_delta = config["confidence"]["direct_holdout_delta"]
+        direct_mc_delta = config["confidence"]["monte_carlo_delta"]
+        direct_concentration_delta = direct_total_delta - direct_mc_delta
+        if direct_concentration_delta <= 0.0:
+            raise ValueError("direct holdout delta must exceed its MC allocation")
+        stochastic_prior = CanonicalPosterior(
+            coordinates["right_basis"], config["dataset"]["number_classes"],
+            config["numerics"]["minimum_posterior_std"],
+        )
+        stochastic_prior.freeze()
+        prior_mc = fresh_monte_carlo(
+            stochastic_prior, features_B, base_scores_B, labels_B,
+            config["certification"]["monte_carlo_trials"],
+            config["certification"]["monte_carlo_chunk_size"],
+            config["certification"]["monte_carlo_seed"] + 1,
+            direct_mc_delta,
+        )
+        prior_concentration = pac_bayes_certificate(
+            prior_mc["clopper_pearson_upper"], 0.0, labels_B.numel(),
+            direct_concentration_delta,
+        )
         direct_holdout = {
-            "errors": errors, "sample_size": labels_B.numel(), "observed_error": errors / labels_B.numel(),
-            "delta": config["confidence"]["direct_holdout_delta"],
-            "upper": clopper_pearson_upper(errors, labels_B.numel(), config["confidence"]["direct_holdout_delta"]),
+            "method": "stochastic_prior_Q_equals_P",
+            "sample_size": labels_B.numel(),
+            "monte_carlo": prior_mc,
+            "monte_carlo_delta": direct_mc_delta,
+            "concentration_delta": direct_concentration_delta,
+            "total_delta": direct_total_delta,
+            "concentration_binary_kl_budget": prior_concentration["binary_kl_budget"],
+            "concentration_increase": (
+                prior_concentration["population_gibbs_risk_upper"]
+                - prior_mc["clopper_pearson_upper"]
+            ),
+            "population_gibbs_risk_upper": prior_concentration["population_gibbs_risk_upper"],
+            "upper": prior_concentration["population_gibbs_risk_upper"],
             "confidence_statement_is_separate": True,
         }
 

@@ -1,10 +1,8 @@
 {
   "name": "cifar10-imagenet-r18",
-  "seed": 17,
   "dataset": {
     "name": "cifar10",
     "prior_fraction": 0.0,
-    "split_seed": 17,
     "number_classes": 10
   },
   "encoder": {
@@ -42,7 +40,6 @@
     "training_quadrature_order": 32,
     "selection_quadrature_order": 256,
     "selection_chunk_size": 256,
-    "seed": 17,
     "gradient_clip_norm": 10.0
   },
   "confidence": {
@@ -55,7 +52,6 @@
   "certification": {
     "monte_carlo_trials": 5000000,
     "monte_carlo_chunk_size": 20000,
-    "monte_carlo_seed": 9100003,
     "diagnostic_quadrature_order": 256,
     "evaluate_test": true,
     "direct_holdout": false
