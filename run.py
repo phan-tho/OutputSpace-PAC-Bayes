@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import time
 from typing import Any, Sequence
@@ -19,7 +20,7 @@ from models import (
 )
 from pac_bayes import (
     fresh_monte_carlo, gauss_hermite_risk,
-    observable_coordinates, optimize_posterior, pac_bayes_certificate,
+    kl_upper_inverse, observable_coordinates, optimize_posterior, pac_bayes_certificate,
 )
 from utils import (
     choose_device, git_commit, json_ready, load_config, runtime_info, save_json,
@@ -169,11 +170,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     direct_holdout = None
     if config["certification"]["direct_holdout"] and config["prior"]["source"] == "a_trained":
         # Q=P is the stochastic prior. MC bounds its empirical Gibbs risk on B;
-        # a zero-KL PAC-Bayes step then adds concentration from B to population.
+        # a fixed-function binary-KL step adds concentration from B to population.
         direct_total_delta = config["confidence"]["direct_holdout_delta"]
         direct_mc_delta = config["confidence"]["monte_carlo_delta"]
-        direct_concentration_delta = direct_total_delta - direct_mc_delta
-        if direct_concentration_delta <= 0.0:
+        direct_data_delta = direct_total_delta - direct_mc_delta
+        if direct_data_delta <= 0.0:
             raise ValueError("direct holdout delta must exceed its MC allocation")
         stochastic_prior = CanonicalPosterior(
             coordinates["right_basis"], config["dataset"]["number_classes"],
@@ -187,24 +188,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             config["certification"]["monte_carlo_seed"] + 1,
             direct_mc_delta,
         )
-        prior_concentration = pac_bayes_certificate(
-            prior_mc["clopper_pearson_upper"], 0.0, labels_B.numel(),
-            direct_concentration_delta,
+        direct_budget = math.log(1.0 / direct_data_delta) / labels_B.numel()
+        direct_upper = kl_upper_inverse(
+            prior_mc["clopper_pearson_upper"], direct_budget
         )
         direct_holdout = {
             "method": "stochastic_prior_Q_equals_P",
             "sample_size": labels_B.numel(),
             "monte_carlo": prior_mc,
             "monte_carlo_delta": direct_mc_delta,
-            "concentration_delta": direct_concentration_delta,
+            "concentration_delta": direct_data_delta,
             "total_delta": direct_total_delta,
-            "concentration_binary_kl_budget": prior_concentration["binary_kl_budget"],
+            "concentration_binary_kl_budget": direct_budget,
             "concentration_increase": (
-                prior_concentration["population_gibbs_risk_upper"]
-                - prior_mc["clopper_pearson_upper"]
+                direct_upper - prior_mc["clopper_pearson_upper"]
             ),
-            "population_gibbs_risk_upper": prior_concentration["population_gibbs_risk_upper"],
-            "upper": prior_concentration["population_gibbs_risk_upper"],
+            "population_gibbs_risk_upper": direct_upper,
+            "upper": direct_upper,
             "confidence_statement_is_separate": True,
         }
 
