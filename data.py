@@ -135,6 +135,8 @@ def transform_image(image: Tensor, transform: Mapping[str, Any]) -> Tensor:
     if kind == "identity":
         return image.to(torch.float32)
     value = image.to(torch.float32).div(255.0)
+    if kind == "fixed_minus_one_one":
+        return value.mul(2.0).sub(1.0)
     if kind == "channel_standardize":
         mean = value.new_tensor(transform["mean"])[:, None, None]
         std = value.new_tensor(transform["std"])[:, None, None]
@@ -209,7 +211,8 @@ def _load_set(
     if name == "mnist":
         from torchvision.datasets import MNIST
 
-        dataset = MNIST(root=str(data_root), train=train, download=download)
+        root = data_root.parent if (data_root / "raw").is_dir() else data_root
+        dataset = MNIST(root=str(root), train=train, download=download)
         return dataset.data.unsqueeze(1).contiguous(), dataset.targets.to(torch.long)
     if name in {"cifar10", "cifar100"}:
         directory = _find_cifar_python_directory(name, data_root)

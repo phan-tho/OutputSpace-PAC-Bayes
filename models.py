@@ -228,7 +228,7 @@ def train_or_load_prior(
     checkpoint: Path | None,
 ) -> dict[str, Any]:
     model.to(device)
-    if config["source"] == "upstream":
+    if config["source"] in {"upstream", "random"}:
         model.freeze()
         return {
             "selected_epoch": 0, "selected_calibration_error": None,
@@ -434,10 +434,39 @@ def fit_feature_transform(raw_A: Tensor, config: Mapping[str, Any]) -> dict[str,
     raise ValueError("upstream feature transforms must be loaded from an artifact")
 
 
+def make_random_feature_transform(
+    raw_dimension: int, config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fixed random projection chosen before any downstream image is read."""
+
+    components = config["rank"] - 1
+    if not 1 <= components <= raw_dimension:
+        raise ValueError("random projection rank exceeds the encoder feature dimension")
+    generator = torch.Generator().manual_seed(config["projection_seed"])
+    draw = torch.randn(raw_dimension, components, generator=generator, dtype=torch.float64)
+    basis, triangular = torch.linalg.qr(draw, mode="reduced")
+    signs = torch.sign(torch.diagonal(triangular))
+    signs[signs == 0.0] = 1.0
+    directions = (basis * signs).T.contiguous()
+    return {
+        "kind": "random_projection_bias",
+        "directions": directions,
+        "normalization_epsilon": config["normalization_epsilon"],
+        "projection_seed": config["projection_seed"],
+    }
+
+
 def apply_feature_transform(raw_features: Tensor, transform: Mapping[str, Any]) -> Tensor:
     values = raw_features.detach().cpu().to(torch.float64)
     if transform["kind"] == "standardize":
         return (transform["kappa"] * (values - transform["mean"]) / transform["std"]).contiguous()
+    if transform["kind"] == "random_projection_bias":
+        normalized = math.sqrt(values.shape[1]) * values / torch.sqrt(
+            values.square().sum(1, keepdim=True) + transform["normalization_epsilon"]
+        )
+        projected = normalized @ transform["directions"].T
+        bias = torch.ones((values.shape[0], 1), dtype=torch.float64)
+        return (torch.cat((bias, projected), 1) / math.sqrt(projected.shape[1] + 1)).contiguous()
     whitened = ((values - transform["mean"]) @ transform["directions"]) * transform["inverse_scales"]
     bias = torch.ones((values.shape[0], 1), dtype=torch.float64)
     output_dimension = transform["directions"].shape[1] + 1
@@ -452,6 +481,14 @@ def feature_transform_report(transform: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "kind": "standardize", "output_dimension": int(transform["mean"].numel()),
             "kappa": transform["kappa"], "minimum_A_standard_deviation": float(transform["std"].min()),
+        }
+    if transform["kind"] == "random_projection_bias":
+        return {
+            "kind": transform["kind"],
+            "output_dimension": int(transform["directions"].shape[0] + 1),
+            "projection_seed": transform["projection_seed"],
+            "normalization_epsilon": transform["normalization_epsilon"],
+            "projection_sha256": tensor_sha256(transform["directions"]),
         }
     report = {
         "kind": transform["kind"],

@@ -36,13 +36,13 @@ SECTION_FIELDS = {
         "name", "prior_fraction", "number_classes",
         "synthetic_train_size", "synthetic_test_size", "synthetic_input_dimension",
     },
-    "encoder": {"name", "feature_dimension", "width", "dropout"},
+    "encoder": {"name", "feature_dimension", "width", "dropout", "initialization_seed"},
     "prior": {
         "source", "optimizer", "epochs", "batch_size", "learning_rate",
         "weight_decay", "momentum", "warmup_epochs", "calibration_fraction",
         "label_smoothing", "augmentation", "cutout_size", "validation_every",
     },
-    "feature_map": {"kind", "rank", "kappa"},
+    "feature_map": {"kind", "rank", "kappa", "projection_seed", "normalization_epsilon"},
     "posterior": {
         "steps", "checkpoint_every", "batch_size", "learning_rates", "objectives",
         "warmup_steps", "training_quadrature_order", "selection_quadrature_order",
@@ -96,28 +96,41 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("invalid dataset split fraction or class count")
     if encoder["feature_dimension"] <= 0:
         raise ValueError("encoder feature_dimension must be positive")
-    if prior["source"] not in {"a_trained", "upstream"}:
-        raise ValueError("prior source must be a_trained or upstream")
-    if prior["source"] == "upstream" and dataset["prior_fraction"] != 0.0:
-        raise ValueError("upstream transfer requires an empty A block")
+    if prior["source"] not in {"a_trained", "upstream", "random"}:
+        raise ValueError("prior source must be a_trained, upstream, or random")
+    if prior["source"] in {"upstream", "random"} and dataset["prior_fraction"] != 0.0:
+        raise ValueError("upstream and random priors require an empty A block")
     if prior["source"] == "a_trained" and dataset["prior_fraction"] <= 0.0:
         raise ValueError("an A-trained prior requires a nonempty A block")
     if prior["optimizer"] not in {"adamw", "sgd"}:
         raise ValueError("prior optimizer must be adamw or sgd")
     if prior["source"] == "a_trained" and min(prior["epochs"], prior["batch_size"]) <= 0:
         raise ValueError("prior epochs and batch size must be positive")
-    if prior["source"] == "upstream" and prior["epochs"] != 0:
-        raise ValueError("upstream prior must use zero training epochs")
-    if feature_map["kind"] not in {"standardize", "pca_whiten_bias", "upstream_pca"}:
+    if prior["source"] in {"upstream", "random"} and prior["epochs"] != 0:
+        raise ValueError("upstream and random priors must use zero training epochs")
+    if feature_map["kind"] not in {
+        "standardize", "pca_whiten_bias", "upstream_pca", "random_projection_bias"
+    }:
         raise ValueError("unknown feature map")
-    if feature_map["rank"] <= 0 or feature_map["kappa"] <= 0.0:
-        raise ValueError("feature rank and kappa must be positive")
+    if feature_map["rank"] <= 0:
+        raise ValueError("feature rank must be positive")
+    if feature_map["kind"] != "random_projection_bias" and feature_map["kappa"] <= 0.0:
+        raise ValueError("feature kappa must be positive")
     if feature_map["kind"] == "standardize" and feature_map["rank"] != encoder["feature_dimension"]:
         raise ValueError("standardized feature rank must equal encoder dimension")
     if feature_map["kind"] == "pca_whiten_bias" and not 2 <= feature_map["rank"] <= encoder["feature_dimension"] + 1:
         raise ValueError("PCA rank must contain a bias and a valid number of components")
     if feature_map["kind"] == "upstream_pca" and prior["source"] != "upstream":
         raise ValueError("upstream_pca requires an upstream prior")
+    if feature_map["kind"] == "random_projection_bias":
+        if prior["source"] != "random":
+            raise ValueError("random_projection_bias requires a random prior")
+        if encoder["initialization_seed"] < 0:
+            raise ValueError("random encoder initialization seed must be nonnegative")
+        if not 2 <= feature_map["rank"] <= encoder["feature_dimension"] + 1:
+            raise ValueError("random projection rank must contain a bias and fit the encoder")
+        if feature_map["projection_seed"] < 0 or feature_map["normalization_epsilon"] <= 0.0:
+            raise ValueError("random projection seed and epsilon must be positive")
     if min(
         posterior["steps"], posterior["checkpoint_every"], posterior["batch_size"],
         posterior["training_quadrature_order"], posterior["selection_quadrature_order"],

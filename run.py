@@ -16,6 +16,7 @@ from models import (
     CanonicalPosterior,
     PriorModel, apply_feature_transform, extract_prior_outputs, feature_transform_report,
     fit_feature_transform, load_upstream_feature_transform, make_backbone,
+    make_random_feature_transform,
     train_or_load_prior, validate_upstream_backbone,
 )
 from pac_bayes import (
@@ -73,6 +74,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     data_root, output_path = args.data_root.resolve(), args.output.resolve()
     print(f"[setup] {config['name']} on {device}")
 
+    # A random prior is fully fixed and hashed before reading downstream data.
+    random_prior_hash = None
+    if config["prior"]["source"] == "random":
+        if any(value is not None for value in (
+            args.prior_checkpoint, args.upstream_stats, args.encoder_weights
+        )):
+            raise ValueError("a random prior does not accept checkpoint, artifact, or encoder weights")
+        torch.manual_seed(config["encoder"]["initialization_seed"])
+        backbone = make_backbone(
+            config["encoder"], config["dataset"].get("synthetic_input_dimension"), None
+        )
+        prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=True)
+        prior.freeze()
+        random_prior_hash = state_dict_sha256(prior.state_dict())
+        input_transform = {"kind": "fixed_minus_one_one"}
+        feature_transform = make_random_feature_transform(
+            backbone.feature_dim, config["feature_map"]
+        )
+        torch.manual_seed(config["seed"])
+
     # 2. Load only the training dataset. Test data is deliberately not loaded here.
     train_images, train_labels = load_training_set(
         config["dataset"], data_root, args.download, config["seed"]
@@ -85,19 +106,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[data] A={A_indices.numel()} B={B_indices.numel()} (index-only split)")
 
     # 4. Train or load the deterministic prior. Every learned choice here uses A only.
-    backbone = make_backbone(
-        config["encoder"], config["dataset"].get("synthetic_input_dimension"),
-        args.encoder_weights.resolve() if args.encoder_weights else None,
-    )
     upstream_audit = None
     if config["prior"]["source"] == "a_trained":
+        backbone = make_backbone(
+            config["encoder"], config["dataset"].get("synthetic_input_dimension"),
+            args.encoder_weights.resolve() if args.encoder_weights else None,
+        )
         if args.upstream_stats is not None:
             raise ValueError("--upstream-stats is only valid for the transfer preset")
         input_transform = fit_A_only_input_transform(
             train_images, A_indices, config["dataset"]["name"]
         )
         prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=False)
-    else:
+    elif config["prior"]["source"] == "upstream":
+        backbone = make_backbone(
+            config["encoder"], config["dataset"].get("synthetic_input_dimension"),
+            args.encoder_weights.resolve() if args.encoder_weights else None,
+        )
         if args.upstream_stats is None:
             raise ValueError("the transfer preset requires --upstream-stats")
         if args.prior_checkpoint is not None:
@@ -113,6 +138,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device, args.workers, config["seed"],
         args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
     )
+    if random_prior_hash is not None:
+        if prior_metrics["state_sha256"] != random_prior_hash:
+            raise RuntimeError("random prior changed after downstream data was loaded")
+        prior_metrics["initial_state_sha256_before_downstream_data"] = random_prior_hash
     print(f"[prior] epoch={prior_metrics['selected_epoch']} training_gpus={prior_metrics['training_gpu_count']}")
 
     # 5. Fit the stochastic feature transformation using A only.
@@ -132,6 +161,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max(config["prior"]["batch_size"], 256), device, args.workers,
     )
     features_B = apply_feature_transform(raw_B, feature_transform)
+    if config["prior"]["source"] == "random":
+        if bool(torch.any(features_B.square().sum(1) == 0.0)):
+            raise RuntimeError("random feature map lost its required constant coordinate")
+        prior_metrics["exact_population_gibbs_risk"] = (
+            1.0 - 1.0 / config["dataset"]["number_classes"]
+        )
 
     # 7. Compute B's observable coordinates, retaining every nonzero SVD direction.
     coordinates = observable_coordinates(
@@ -139,6 +174,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if coordinates["observed_rank"] != config["feature_map"]["rank"]:
         raise RuntimeError("observable B rank differs from the declared feature rank")
+    if config["prior"]["source"] == "random":
+        # The SVD is an audit only. The diagonal posterior stays in fixed phi_R coordinates.
+        coordinates["right_basis"] = torch.eye(features_B.shape[1], dtype=torch.float64)
+        coordinates["posterior_coordinate_system"] = "fixed_random_feature_coordinates"
     print(
         f"[support] rank={coordinates['observed_rank']}/{coordinates['latent_dimension']} "
         f"condition={coordinates['condition_number']:.6g} discarded=0"
@@ -293,6 +332,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "fresh_mc": fresh_mc, "certificate": certificate, "diagnostics": diagnostics,
         "elapsed_seconds": time.perf_counter() - started,
     }
+    if config["prior"]["source"] == "random":
+        metrics["data"].update({
+            "raw_image_sha256": tensor_sha256(train_images),
+            "label_sha256": tensor_sha256(train_labels),
+            "B_feature_sha256": tensor_sha256(features_B),
+        })
     result = {
         "config": {
             "scientific": config, "runtime": runtime_info(device), "git_commit": git_commit(HERE),
