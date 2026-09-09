@@ -4,5 +4,6 @@ __pycache__/
 .DS_Store
 data/
 results/
+kaggle/
 *.pt
 

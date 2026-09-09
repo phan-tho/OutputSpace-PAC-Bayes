@@ -276,12 +276,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if state_dict_sha256(posterior.state_dict()) != frozen_posterior_hash:
         raise RuntimeError("posterior changed during final Monte Carlo")
 
-    # 12. Combine the conservative MC endpoint with the quotient KL certificate.
+    # 12. Combine the same conservative MC endpoint with output and raw KL.
     certificate = pac_bayes_certificate(
         fresh_mc["clopper_pearson_upper"], quotient_kl_value, labels_B.numel(),
         config["confidence"]["pac_bayes_delta_each"],
     )
-    certificate.update({
+    raw_gaussian_certificate = pac_bayes_certificate(
+        fresh_mc["clopper_pearson_upper"], raw_kl_value, labels_B.numel(),
+        config["confidence"]["pac_bayes_delta_each"],
+    )
+    confidence_report = {
         "n_B": labels_B.numel(),
         "pac_bayes_delta_each": config["confidence"]["pac_bayes_delta_each"],
         "pac_bayes_family_count": config["confidence"]["pac_bayes_family_count"],
@@ -291,7 +295,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             + config["confidence"]["monte_carlo_delta"]
         ),
         "selection_preceded_final_mc": True,
-    })
+    }
+    certificate.update(confidence_report)
+    certificate["kl_type"] = "output_space_quotient"
+    raw_gaussian_certificate.update(confidence_report)
+    raw_gaussian_certificate["kl_type"] = "raw_gaussian_parameter"
     print(
         f"[certificate] MC={100*fresh_mc['observed_risk']:.4f}% "
         f"CP={100*fresh_mc['clopper_pearson_upper']:.4f}% "
@@ -323,6 +331,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("posterior changed during diagnostic test evaluation")
 
     # 14. Save exactly one compact JSON result.
+    paper_table = {
+        "ours_output_space_kl": {
+            "R_hat_B_percent": 100.0 * fresh_mc["observed_risk"],
+            "KL_over_n_B": quotient_kl_value / labels_B.numel(),
+            "certificate_percent": 100.0 * certificate["population_gibbs_risk_upper"],
+            "test_risk_percent": (
+                100.0 * diagnostics["test_gibbs_risk_gauss_hermite"]
+                if diagnostics["test_loaded_after_certificate"] else None
+            ),
+        },
+        "raw_gaussian_parameter_kl": {
+            "R_hat_B_percent": 100.0 * fresh_mc["observed_risk"],
+            "KL_over_n_B": raw_kl_value / labels_B.numel(),
+            "certificate_percent": 100.0 * raw_gaussian_certificate["population_gibbs_risk_upper"],
+            "test_risk_percent": (
+                100.0 * diagnostics["test_gibbs_risk_gauss_hermite"]
+                if diagnostics["test_loaded_after_certificate"] else None
+            ),
+        },
+        "direct_holdout_stochastic_prior": (
+            None if direct_holdout is None else {
+                "R_hat_B_percent": 100.0 * direct_holdout["monte_carlo"]["observed_risk"],
+                "KL_over_n_B": 0.0,
+                "certificate_percent": 100.0 * direct_holdout["population_gibbs_risk_upper"],
+                "test_risk_percent": None,
+            }
+        ),
+    }
     metrics = {
         "status": "certified",
         "data": {
@@ -347,7 +383,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "raw_nats": raw_kl_value, "quotient_nats": quotient_kl_value,
             "same_posterior_state_sha256": frozen_posterior_hash,
         },
-        "fresh_mc": fresh_mc, "certificate": certificate, "diagnostics": diagnostics,
+        "fresh_mc": fresh_mc, "certificate": certificate,
+        "raw_gaussian_certificate": raw_gaussian_certificate,
+        "paper_table": paper_table, "diagnostics": diagnostics,
         "elapsed_seconds": time.perf_counter() - started,
     }
     if config["prior"]["source"] == "random":
