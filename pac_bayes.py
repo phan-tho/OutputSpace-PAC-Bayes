@@ -262,9 +262,21 @@ def optimize_posterior(
     if features_B.dtype != torch.float64 or features_B.device.type != "cpu":
         raise ValueError("posterior selection inputs must be CPU float64")
     basis = coordinates["right_basis"]
+    # Large-class ImageNet runs use a fixed B subset only to rank checkpoints.
+    # This score is not reported as the certificate: fresh MC later evaluates
+    # the frozen winner over all of B.
+    selection_count = min(config.get("selection_examples", labels_B.numel()), labels_B.numel())
+    selection_indices = torch.randperm(
+        labels_B.numel(), generator=torch.Generator().manual_seed(config["seed"] + 777)
+    )[:selection_count]
+    selection_features = features_B.index_select(0, selection_indices)
+    selection_scores = base_scores_B.index_select(0, selection_indices)
+    selection_labels = labels_B.index_select(0, selection_indices)
     initial = CanonicalPosterior(basis, number_classes, minimum_std)
     q_equals_p = _posterior_summary(
-        "Q=P", None, None, 0, initial, features_B, base_scores_B, labels_B, config, delta
+        "Q=P", None, None, 0, initial,
+        selection_features, selection_scores, selection_labels,
+        config, delta, labels_B.numel(),
     )
     selected = q_equals_p
     selected_state = _cpu_state(initial.state_dict())
@@ -327,7 +339,8 @@ def optimize_posterior(
                     portable.load_state_dict(portable_state, strict=True)
                     summary = _posterior_summary(
                         f"{objective_name} lr={learning_rate:g}", objective_name, learning_rate,
-                        step, portable, features_B, base_scores_B, labels_B, config, delta,
+                        step, portable, selection_features, selection_scores, selection_labels,
+                        config, delta, labels_B.numel(),
                     )
                     states_evaluated += 1
                     if _selection_key(summary) < _selection_key(selected):
@@ -338,7 +351,8 @@ def optimize_posterior(
     posterior.load_state_dict(selected_state, strict=True)
     replay = _posterior_summary(
         selected["candidate"], selected["objective"], selected["learning_rate"], selected["step"],
-        posterior, features_B, base_scores_B, labels_B, config, delta,
+        posterior, selection_features, selection_scores, selection_labels,
+        config, delta, labels_B.numel(),
     )
     if replay != selected:
         raise RuntimeError("selected posterior did not replay exactly")
@@ -356,16 +370,18 @@ def _posterior_summary(
     labels: Tensor,
     config: Mapping[str, Any],
     delta: float,
+    complexity_sample_size: int,
 ) -> dict[str, Any]:
     risk = gauss_hermite_risk(
         posterior, features, base_scores, labels,
         config["selection_quadrature_order"], config["selection_chunk_size"],
     )
     raw, output = posterior.kl_values()
-    bound = pac_bayes_certificate(risk, float(output), labels.numel(), delta)
+    bound = pac_bayes_certificate(risk, float(output), complexity_sample_size, delta)
     return {
         "candidate": candidate_name, "objective": objective_name,
         "learning_rate": learning_rate, "step": step,
+        "selection_examples": labels.numel(),
         "B_gauss_hermite_risk": risk, "raw_kl": float(raw), "output_kl": float(output),
         "selection_upper": bound["population_gibbs_risk_upper"],
         "mean_l2": float(torch.linalg.vector_norm(posterior.mean.detach())),

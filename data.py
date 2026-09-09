@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import pickle
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,13 +16,13 @@ from torch.utils.data import Dataset
 
 def load_training_set(
     config: Mapping[str, Any], data_root: Path, download: bool, experiment_seed: int
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Any, Tensor]:
     return _load_set(config, data_root, train=True, download=download, seed=experiment_seed)
 
 
 def load_test_set(
     config: Mapping[str, Any], data_root: Path, download: bool, experiment_seed: int
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Any, Tensor]:
     """Called only after the certificate is frozen."""
 
     return _load_set(config, data_root, train=False, download=download, seed=experiment_seed)
@@ -65,10 +66,19 @@ def split_A_for_checkpoint_selection(
 
 
 def fit_A_only_input_transform(
-    images: Tensor, A_indices: Tensor, dataset_name: str
+    images: Any, A_indices: Tensor, dataset_name: str
 ) -> dict[str, Any]:
     if dataset_name == "synthetic":
         return {"kind": "identity"}
+    if dataset_name == "imagenet":
+        # Fixed public preprocessing; it is independent of both A and B.
+        return {
+            "kind": "imagenet_standard",
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+            "resize_size": 256,
+            "crop_size": 224,
+        }
     selected = images.index_select(0, A_indices).to(torch.float64).div(255.0)
     mean = selected.mean(dim=(0, 2, 3))
     std = selected.std(dim=(0, 2, 3), unbiased=False)
@@ -102,12 +112,13 @@ def upstream_input_transform(preprocessing: Mapping[str, Any]) -> dict[str, Any]
 class IndexedDataset(Dataset[tuple[Tensor, Tensor]]):
     def __init__(
         self,
-        images: Tensor,
+        images: Any,
         labels: Tensor,
         indices: Tensor,
         input_transform: Mapping[str, Any],
         *,
         cifar_augmentation: bool = False,
+        imagenet_augmentation: bool = False,
         cutout_size: int = 0,
     ) -> None:
         self.images = images
@@ -115,6 +126,7 @@ class IndexedDataset(Dataset[tuple[Tensor, Tensor]]):
         self.indices = indices
         self.input_transform = input_transform
         self.cifar_augmentation = cifar_augmentation
+        self.imagenet_augmentation = imagenet_augmentation
         self.cutout_size = cutout_size
 
     def __len__(self) -> int:
@@ -125,6 +137,8 @@ class IndexedDataset(Dataset[tuple[Tensor, Tensor]]):
         image = self.images[index]
         if self.cifar_augmentation:
             image = _augment_cifar(image, self.input_transform, self.cutout_size)
+        elif self.imagenet_augmentation:
+            image = _augment_imagenet(image, self.input_transform)
         else:
             image = transform_image(image, self.input_transform)
         return image, self.labels[index]
@@ -134,6 +148,19 @@ def transform_image(image: Tensor, transform: Mapping[str, Any]) -> Tensor:
     kind = transform["kind"]
     if kind == "identity":
         return image.to(torch.float32)
+    if kind == "imagenet_standard":
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms import functional as TF
+
+        value = TF.resize(
+            image, [transform["resize_size"]],
+            interpolation=InterpolationMode.BILINEAR, antialias=True,
+        )
+        value = TF.center_crop(value, [transform["crop_size"]])
+        value = value.to(torch.float32).div(255.0)
+        mean = value.new_tensor(transform["mean"])[:, None, None]
+        std = value.new_tensor(transform["std"])[:, None, None]
+        return (value - mean) / std
     value = image.to(torch.float32).div(255.0)
     if kind == "fixed_minus_one_one":
         return value.mul(2.0).sub(1.0)
@@ -186,6 +213,26 @@ def _augment_cifar(
     return value
 
 
+def _augment_imagenet(image: Tensor, transform: Mapping[str, Any]) -> Tensor:
+    from torchvision.transforms import InterpolationMode, RandomResizedCrop
+    from torchvision.transforms import functional as TF
+
+    top, left, height, width = RandomResizedCrop.get_params(
+        image, scale=(0.08, 1.0), ratio=(3.0 / 4.0, 4.0 / 3.0)
+    )
+    value = TF.resized_crop(
+        image, top, left, height, width,
+        [transform["crop_size"], transform["crop_size"]],
+        interpolation=InterpolationMode.BILINEAR, antialias=True,
+    )
+    if bool(torch.rand(()) < 0.5):
+        value = torch.flip(value, dims=(2,))
+    value = value.to(torch.float32).div(255.0)
+    mean = value.new_tensor(transform["mean"])[:, None, None]
+    std = value.new_tensor(transform["std"])[:, None, None]
+    return (value - mean) / std
+
+
 def _load_set(
     config: Mapping[str, Any],
     data_root: Path,
@@ -193,7 +240,7 @@ def _load_set(
     train: bool,
     download: bool,
     seed: int,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Any, Tensor]:
     name = config["name"]
     if name == "synthetic":
         count = config["synthetic_train_size"] if train else config["synthetic_test_size"]
@@ -226,7 +273,74 @@ def _load_set(
         dataset = dataset_class(root=str(data_root), train=train, download=True)
         images = torch.from_numpy(np.asarray(dataset.data).copy()).permute(0, 3, 1, 2)
         return images.contiguous(), torch.tensor(dataset.targets, dtype=torch.long)
+    if name == "imagenet":
+        if download:
+            raise ValueError("ImageNet must be downloaded separately; do not use --download")
+        return _load_imagenet_paths(data_root, train)
     raise ValueError(f"unsupported dataset: {name}")
+
+
+class ImageNetPaths:
+    """A lightweight path collection; images are decoded only when requested."""
+
+    def __init__(self, paths: list[Path]) -> None:
+        self.paths = paths
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> Tensor:
+        from torchvision.io import ImageReadMode, read_image
+
+        return read_image(str(self.paths[index]), mode=ImageReadMode.RGB)
+
+
+def _load_imagenet_paths(data_root: Path, train: bool) -> tuple[ImageNetPaths, Tensor]:
+    candidates = [
+        data_root / "ILSVRC" / "Data" / "CLS-LOC",
+        data_root / "Data" / "CLS-LOC",
+        data_root,
+    ]
+    cls_loc = next(
+        (path for path in candidates if (path / "train").is_dir() and (path / "val").is_dir()),
+        None,
+    )
+    if cls_loc is None:
+        raise FileNotFoundError(
+            f"expected ILSVRC/Data/CLS-LOC/{{train,val}} below {data_root}"
+        )
+
+    class_directories = sorted(path for path in (cls_loc / "train").iterdir() if path.is_dir())
+    if len(class_directories) != 1000:
+        raise RuntimeError(f"expected 1000 ImageNet classes, found {len(class_directories)}")
+    class_index = {path.name: index for index, path in enumerate(class_directories)}
+
+    if train:
+        paths, labels = [], []
+        for synset_directory in class_directories:
+            class_paths = sorted(synset_directory.glob("*.JPEG"))
+            paths.extend(class_paths)
+            labels.extend([class_index[synset_directory.name]] * len(class_paths))
+        if len(paths) != 1_281_167:
+            raise RuntimeError(f"expected 1,281,167 ImageNet training images, found {len(paths)}")
+        return ImageNetPaths(paths), torch.tensor(labels, dtype=torch.long)
+
+    solution_candidates = [
+        data_root / "LOC_val_solution.csv",
+        cls_loc.parents[2] / "LOC_val_solution.csv",
+    ]
+    solution_path = next((path for path in solution_candidates if path.is_file()), None)
+    if solution_path is None:
+        raise FileNotFoundError("LOC_val_solution.csv is required for diagnostic validation labels")
+    labels_by_id = {}
+    with solution_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            labels_by_id[row["ImageId"]] = class_index[row["PredictionString"].split()[0]]
+    paths = sorted((cls_loc / "val").glob("*.JPEG"))
+    labels = torch.tensor([labels_by_id[path.stem] for path in paths], dtype=torch.long)
+    if len(paths) != 50_000:
+        raise RuntimeError(f"expected 50,000 ImageNet validation images, found {len(paths)}")
+    return ImageNetPaths(paths), labels
 
 
 def _find_cifar_python_directory(name: str, root: Path) -> Path | None:

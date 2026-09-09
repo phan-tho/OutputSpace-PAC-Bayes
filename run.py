@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any, Sequence
 
 import torch
+import torch.distributed as dist
 
 from data import fit_A_only_input_transform, load_test_set, load_training_set, observation_independent_split
 from models import (
@@ -70,9 +72,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     config["posterior"]["seed"] = args.seed + 10_000
     config["certification"]["monte_carlo_seed"] = args.seed + 20_000
     device = choose_device(args.device)
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if device.type == "cuda":
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+    rank = dist.get_rank() if distributed else 0
     set_deterministic(config["seed"])
     data_root, output_path = args.data_root.resolve(), args.output.resolve()
-    print(f"[setup] {config['name']} on {device}")
+    if rank == 0:
+        print(f"[setup] {config['name']} on {device}")
 
     # A random prior is fully fixed and hashed before reading downstream data.
     random_prior_hash = None
@@ -103,7 +114,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     A_indices, B_indices = observation_independent_split(
         train_labels.numel(), config["dataset"]["prior_fraction"], config["dataset"]["split_seed"]
     )
-    print(f"[data] A={A_indices.numel()} B={B_indices.numel()} (index-only split)")
+    if rank == 0:
+        print(f"[data] A={A_indices.numel()} B={B_indices.numel()} (index-only split)")
 
     # 4. Train or load the deterministic prior. Every learned choice here uses A only.
     upstream_audit = None
@@ -138,6 +150,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device, args.workers, config["seed"],
         args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
     )
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+        if rank != 0:
+            return {"worker_rank": rank, "status": "prior_training_complete"}
     if random_prior_hash is not None:
         if prior_metrics["state_sha256"] != random_prior_hash:
             raise RuntimeError("random prior changed after downstream data was loaded")
@@ -149,6 +166,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raw_A, _, _ = extract_prior_outputs(
             prior, train_images, train_labels, A_indices, input_transform,
             max(config["prior"]["batch_size"], 256), device, args.workers,
+            include_scores=False,
         )
         feature_transform = fit_feature_transform(raw_A, config["feature_map"])
 

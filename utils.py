@@ -41,12 +41,13 @@ SECTION_FIELDS = {
         "source", "optimizer", "epochs", "batch_size", "learning_rate",
         "weight_decay", "momentum", "warmup_epochs", "calibration_fraction",
         "label_smoothing", "augmentation", "cutout_size", "validation_every",
+        "schedule", "lr_milestones", "lr_gamma",
     },
     "feature_map": {"kind", "rank", "kappa", "projection_seed", "normalization_epsilon"},
     "posterior": {
         "steps", "checkpoint_every", "batch_size", "learning_rates", "objectives",
         "warmup_steps", "training_quadrature_order", "selection_quadrature_order",
-        "selection_chunk_size", "gradient_clip_norm",
+        "selection_chunk_size", "selection_examples", "gradient_clip_norm",
     },
     "confidence": {
         "total_failure_probability", "pac_bayes_delta_each",
@@ -90,8 +91,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
     certification = config["certification"]
     numerics = config["numerics"]
 
-    if dataset["name"] not in {"synthetic", "mnist", "cifar10", "cifar100"}:
-        raise ValueError("dataset must be synthetic, mnist, cifar10, or cifar100")
+    if dataset["name"] not in {"synthetic", "mnist", "cifar10", "cifar100", "imagenet"}:
+        raise ValueError("unsupported dataset")
     if not 0.0 <= dataset["prior_fraction"] < 1.0 or dataset["number_classes"] < 2:
         raise ValueError("invalid dataset split fraction or class count")
     if encoder["feature_dimension"] <= 0:
@@ -104,6 +105,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("an A-trained prior requires a nonempty A block")
     if prior["optimizer"] not in {"adamw", "sgd"}:
         raise ValueError("prior optimizer must be adamw or sgd")
+    if prior.get("schedule", "cosine") not in {"cosine", "step"}:
+        raise ValueError("prior schedule must be cosine or step")
+    if prior.get("schedule") == "step" and (
+        not prior.get("lr_milestones") or not 0.0 < prior.get("lr_gamma", 0.0) < 1.0
+    ):
+        raise ValueError("step schedule needs milestones and lr_gamma in (0,1)")
     if prior["source"] == "a_trained" and min(prior["epochs"], prior["batch_size"]) <= 0:
         raise ValueError("prior epochs and batch size must be positive")
     if prior["source"] in {"upstream", "random"} and prior["epochs"] != 0:
@@ -139,6 +146,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("posterior counts must be positive")
     if posterior["warmup_steps"] < 0 or not posterior["learning_rates"]:
         raise ValueError("invalid posterior warmup or learning-rate list")
+    if posterior.get("selection_examples", 1) <= 0:
+        raise ValueError("posterior selection_examples must be positive")
     if any(value <= 0.0 for value in posterior["learning_rates"]):
         raise ValueError("posterior learning rates must be positive")
     if not posterior["objectives"] or any(

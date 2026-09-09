@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from data import IndexedDataset, split_A_for_checkpoint_selection, upstream_input_transform
 from utils import file_sha256, state_dict_sha256, tensor_sha256
@@ -154,11 +157,28 @@ class ImageNetResNet18Backbone(nn.Module):
         return self.model(inputs)
 
 
+class ResNet18Backbone(nn.Module):
+    """Randomly initialized torchvision ResNet-18 for an A-trained prior."""
+
+    feature_dim = 512
+
+    def __init__(self) -> None:
+        super().__init__()
+        from torchvision.models import resnet18
+
+        self.model = resnet18(weights=None)
+        self.model.fc = nn.Identity()
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.model(inputs)
+
+
 BACKBONES = {
     "mlp": MlpBackbone,
     "mnist_cnn": MnistCnnBackbone,
     "lenet5": LeNet5Backbone,
     "wrn28_4": WideResNet28x4Backbone,
+    "resnet18": ResNet18Backbone,
     "imagenet_resnet18": ImageNetResNet18Backbone,
 }
 
@@ -177,6 +197,10 @@ def make_backbone(
         backbone = BACKBONES[name]()
     elif name == "wrn28_4":
         backbone = BACKBONES[name](config["feature_dimension"], config["dropout"])
+    elif name == "resnet18":
+        if weights_path is not None:
+            raise ValueError("the A-trained ResNet-18 must start from its fixed random initialization")
+        backbone = BACKBONES[name]()
     elif name == "imagenet_resnet18":
         backbone = BACKBONES[name](weights_path)
     else:
@@ -217,7 +241,7 @@ class PriorModel(nn.Module):
 
 def train_or_load_prior(
     model: PriorModel,
-    images: Tensor,
+    images: Any,
     labels: Tensor,
     A_indices: Tensor,
     input_transform: Mapping[str, Any],
@@ -262,19 +286,28 @@ def train_or_load_prior(
     training_set = IndexedDataset(
         images, labels, fit_indices, input_transform,
         cifar_augmentation=config["augmentation"] == "cifar",
+        imagenet_augmentation=config["augmentation"] == "imagenet",
         cutout_size=config["cutout_size"],
     )
+    distributed = dist.is_available() and dist.is_initialized()
+    sampler = DistributedSampler(
+        training_set, shuffle=True, seed=seed + 2
+    ) if distributed else None
     loader = DataLoader(
-        training_set, batch_size=config["batch_size"], shuffle=True,
-        generator=torch.Generator().manual_seed(seed + 2), num_workers=workers,
+        training_set, batch_size=config["batch_size"], shuffle=sampler is None,
+        sampler=sampler, generator=torch.Generator().manual_seed(
+            seed + 2 + (dist.get_rank() if distributed else 0)
+        ), num_workers=workers,
         pin_memory=device.type == "cuda",
+        persistent_workers=workers > 0,
     )
 
-    # On Kaggle's T4 x2 runtime, DataParallel splits every CIFAR training batch.
-    training_gpu_count = torch.cuda.device_count() if device.type == "cuda" else 0
+    training_gpu_count = dist.get_world_size() if distributed else int(device.type == "cuda")
     training_model: nn.Module = model
-    if training_gpu_count > 1:
-        training_model = nn.DataParallel(model, device_ids=list(range(training_gpu_count)))
+    if distributed:
+        training_model = DistributedDataParallel(
+            model, device_ids=[device.index] if device.type == "cuda" else None
+        )
 
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if config["optimizer"] == "adamw":
@@ -294,14 +327,21 @@ def train_or_load_prior(
     best_state, best_epoch = None, 0
     best_calibration = (math.inf, math.inf)
     final_training_loss = math.nan
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     for epoch in range(1, config["epochs"] + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         if config["optimizer"] == "sgd":
-            warmup = config.get("warmup_epochs", 0)
-            if warmup and epoch <= warmup:
-                factor = epoch / warmup
+            if config.get("schedule", "cosine") == "step":
+                decays = sum(epoch > milestone for milestone in config["lr_milestones"])
+                factor = config["lr_gamma"] ** decays
             else:
-                progress = (epoch - warmup) / max(1, config["epochs"] - warmup)
-                factor = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+                warmup = config.get("warmup_epochs", 0)
+                if warmup and epoch <= warmup:
+                    factor = epoch / warmup
+                else:
+                    progress = (epoch - warmup) / max(1, config["epochs"] - warmup)
+                    factor = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
             for group in optimizer.param_groups:
                 group["lr"] = config["learning_rate"] * factor
 
@@ -311,15 +351,27 @@ def train_or_load_prior(
             batch_images = batch_images.to(device, non_blocking=True)
             batch_labels = batch_labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(
-                training_model(batch_images), batch_labels,
-                label_smoothing=config["label_smoothing"],
-            )
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                loss = F.cross_entropy(
+                    training_model(batch_images), batch_labels,
+                    label_smoothing=config["label_smoothing"],
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             loss_sum += float(loss.detach()) * batch_labels.numel()
             examples_seen += batch_labels.numel()
+        if distributed:
+            totals = torch.tensor([loss_sum, examples_seen], dtype=torch.float64, device=device)
+            dist.all_reduce(totals)
+            loss_sum, examples_seen = float(totals[0]), int(totals[1])
         final_training_loss = loss_sum / examples_seen
+        if not distributed or dist.get_rank() == 0:
+            print(
+                f"[prior] epoch={epoch}/{config['epochs']} "
+                f"loss={final_training_loss:.6f} lr={optimizer.param_groups[0]['lr']:.6g}",
+                flush=True,
+            )
 
         validation_every = config.get("validation_every", 1)
         if calibration_indices.numel() and (epoch % validation_every == 0 or epoch == config["epochs"]):
@@ -331,7 +383,7 @@ def train_or_load_prior(
                 best_calibration = (calibration_loss, calibration_error)
                 best_epoch = epoch
                 best_state = _cpu_state(model.state_dict())
-        elif not calibration_indices.numel():
+        elif not calibration_indices.numel() and epoch == config["epochs"]:
             best_epoch = epoch
             best_state = _cpu_state(model.state_dict())
         if scheduler is not None:
@@ -356,32 +408,42 @@ def train_or_load_prior(
 @torch.inference_mode()
 def extract_prior_outputs(
     model: PriorModel,
-    images: Tensor,
+    images: Any,
     labels: Tensor,
     indices: Tensor,
     input_transform: Mapping[str, Any],
     batch_size: int,
     device: torch.device,
     workers: int,
+    *,
+    include_scores: bool = True,
+    output_dtype: torch.dtype = torch.float64,
 ) -> tuple[Tensor, Tensor, Tensor]:
     loader = DataLoader(
         IndexedDataset(images, labels, indices, input_transform), batch_size=batch_size,
         shuffle=False, num_workers=workers, pin_memory=device.type == "cuda",
+        persistent_workers=workers > 0,
     )
     model.eval()
     feature_parts, score_parts, label_parts = [], [], []
     for batch_images, batch_labels in loader:
         raw_features = model.raw_features(batch_images.to(device, non_blocking=True))
-        base_scores = model.base_scores_from_features(raw_features)
-        feature_parts.append(raw_features.cpu().to(torch.float64))
-        score_parts.append(base_scores.cpu().to(torch.float64))
+        feature_parts.append(raw_features.cpu().to(output_dtype))
+        if include_scores:
+            base_scores = model.base_scores_from_features(raw_features)
+            score_parts.append(base_scores.cpu().to(output_dtype))
         label_parts.append(batch_labels.to(torch.long))
-    return torch.cat(feature_parts), torch.cat(score_parts), torch.cat(label_parts)
+    features = torch.cat(feature_parts)
+    scores = (
+        torch.cat(score_parts) if include_scores
+        else torch.empty((features.shape[0], 0), dtype=output_dtype)
+    )
+    return features, scores, torch.cat(label_parts)
 
 
 def prior_loss_and_error(
     model: PriorModel,
-    images: Tensor,
+    images: Any,
     labels: Tensor,
     indices: Tensor,
     input_transform: Mapping[str, Any],
