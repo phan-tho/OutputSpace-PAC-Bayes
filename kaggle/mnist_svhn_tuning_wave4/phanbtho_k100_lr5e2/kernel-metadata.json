@@ -1,0 +1,13 @@
+{
+  "title": "MNIST SVHN k100 lr5e2",
+  "id": "phanbtho/mnist-svhn-k100-lr5e2",
+  "code_file": "run_experiment.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["pdvelez/svhn-matfiles", "mlagunas/mnist-pytorch"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
