@@ -5,4 +5,5 @@ __pycache__/
 data/
 results/
 *.pt
-
+kaggle/
+index-img-net/
