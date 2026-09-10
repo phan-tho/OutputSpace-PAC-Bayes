@@ -96,20 +96,21 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("invalid dataset split fraction or class count")
     if encoder["feature_dimension"] <= 0:
         raise ValueError("encoder feature_dimension must be positive")
-    if prior["source"] not in {"a_trained", "upstream", "random"}:
-        raise ValueError("prior source must be a_trained, upstream, or random")
-    if prior["source"] in {"upstream", "random"} and dataset["prior_fraction"] != 0.0:
-        raise ValueError("upstream and random priors require an empty A block")
+    if prior["source"] not in {"a_trained", "upstream", "random", "svhn_transfer"}:
+        raise ValueError("unknown prior source")
+    if prior["source"] in {"upstream", "random", "svhn_transfer"} and dataset["prior_fraction"] != 0.0:
+        raise ValueError("external and random priors require an empty A block")
     if prior["source"] == "a_trained" and dataset["prior_fraction"] <= 0.0:
         raise ValueError("an A-trained prior requires a nonempty A block")
     if prior["optimizer"] not in {"adamw", "sgd"}:
         raise ValueError("prior optimizer must be adamw or sgd")
-    if prior["source"] == "a_trained" and min(prior["epochs"], prior["batch_size"]) <= 0:
-        raise ValueError("prior epochs and batch size must be positive")
+    if prior["source"] in {"a_trained", "svhn_transfer"} and min(prior["epochs"], prior["batch_size"]) <= 0:
+        raise ValueError("trained prior epochs and batch size must be positive")
     if prior["source"] in {"upstream", "random"} and prior["epochs"] != 0:
         raise ValueError("upstream and random priors must use zero training epochs")
     if feature_map["kind"] not in {
-        "standardize", "pca_whiten_bias", "upstream_pca", "random_projection_bias"
+        "standardize", "pca_whiten_bias", "upstream_pca", "random_projection_bias",
+        "raw_feature_bias",
     }:
         raise ValueError("unknown feature map")
     if feature_map["rank"] <= 0:
@@ -122,6 +123,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("PCA rank must contain a bias and a valid number of components")
     if feature_map["kind"] == "upstream_pca" and prior["source"] != "upstream":
         raise ValueError("upstream_pca requires an upstream prior")
+    if feature_map["kind"] == "raw_feature_bias":
+        if prior["source"] != "svhn_transfer":
+            raise ValueError("raw_feature_bias requires the SVHN transfer prior")
+        if feature_map["rank"] != encoder["feature_dimension"] + 1 or feature_map["kappa"] != 1.0:
+            raise ValueError("raw_feature_bias must retain every raw feature plus one fixed bias")
     if feature_map["kind"] == "random_projection_bias":
         if prior["source"] != "random":
             raise ValueError("random_projection_bias requires a random prior")

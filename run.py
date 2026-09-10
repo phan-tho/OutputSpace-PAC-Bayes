@@ -107,6 +107,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     # 4. Train or load the deterministic prior. Every learned choice here uses A only.
     upstream_audit = None
+    prior_metrics = None
     if config["prior"]["source"] == "a_trained":
         backbone = make_backbone(
             config["encoder"], config["dataset"].get("synthetic_input_dimension"),
@@ -132,12 +133,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         validate_upstream_backbone(backbone, feature_transform)
         prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=True)
+    elif config["prior"]["source"] == "svhn_transfer":
+        if args.upstream_stats is not None or args.encoder_weights is not None:
+            raise ValueError("SVHN transfer accepts only an optional --prior-checkpoint")
+        backbone = make_backbone(config["encoder"], None, None)
+        source_config = {**config["dataset"], "name": "svhn"}
+        source_images, source_labels = load_training_set(
+            source_config, data_root, args.download, config["seed"]
+        )
+        source_indices = torch.arange(source_labels.numel(), dtype=torch.long)
+        input_transform = {"kind": "svhn_mnist"}
+        prior = PriorModel(backbone, config["dataset"]["number_classes"], zero_head=False)
+        prior_metrics = train_or_load_prior(
+            prior, source_images, source_labels, source_indices, input_transform,
+            config["prior"], device, args.workers, config["seed"],
+            args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
+        )
+        prior_metrics["source_classifier_state_sha256"] = prior_metrics["state_sha256"]
+        prior.head = None
+        prior.freeze()
+        prior_metrics["state_sha256"] = state_dict_sha256(prior.state_dict())
+        feature_transform = {
+            "kind": "raw_feature_bias", "raw_dimension": backbone.feature_dim
+        }
+        upstream_audit = {
+            "source_dataset": "svhn", "source_training_size": source_labels.numel(),
+            "target_base_scores": "identically_zero",
+        }
 
-    prior_metrics = train_or_load_prior(
-        prior, train_images, train_labels, A_indices, input_transform, config["prior"],
-        device, args.workers, config["seed"],
-        args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
-    )
+    if prior_metrics is None:
+        prior_metrics = train_or_load_prior(
+            prior, train_images, train_labels, A_indices, input_transform, config["prior"],
+            device, args.workers, config["seed"],
+            args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
+        )
     if random_prior_hash is not None:
         if prior_metrics["state_sha256"] != random_prior_hash:
             raise RuntimeError("random prior changed after downstream data was loaded")

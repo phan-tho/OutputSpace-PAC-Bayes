@@ -458,6 +458,9 @@ def make_random_feature_transform(
 
 def apply_feature_transform(raw_features: Tensor, transform: Mapping[str, Any]) -> Tensor:
     values = raw_features.detach().cpu().to(torch.float64)
+    if transform["kind"] == "raw_feature_bias":
+        bias = torch.ones((values.shape[0], 1), dtype=torch.float64)
+        return torch.cat((bias, values), 1).contiguous()
     if transform["kind"] == "standardize":
         return (transform["kappa"] * (values - transform["mean"]) / transform["std"]).contiguous()
     if transform["kind"] == "random_projection_bias":
@@ -477,6 +480,12 @@ def apply_feature_transform(raw_features: Tensor, transform: Mapping[str, Any]) 
 
 
 def feature_transform_report(transform: Mapping[str, Any]) -> dict[str, Any]:
+    if transform["kind"] == "raw_feature_bias":
+        return {
+            "kind": "raw_feature_bias",
+            "output_dimension": transform["raw_dimension"] + 1,
+            "constant_bias_coordinate": 1.0,
+        }
     if transform["kind"] == "standardize":
         return {
             "kind": "standardize", "output_dimension": int(transform["mean"].numel()),

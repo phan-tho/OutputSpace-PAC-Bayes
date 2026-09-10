@@ -137,6 +137,14 @@ def transform_image(image: Tensor, transform: Mapping[str, Any]) -> Tensor:
     value = image.to(torch.float32).div(255.0)
     if kind == "fixed_minus_one_one":
         return value.mul(2.0).sub(1.0)
+    if kind == "svhn_mnist":
+        if value.shape[0] == 3:
+            weights = value.new_tensor([0.299, 0.587, 0.114])[:, None, None]
+            value = (value * weights).sum(0, keepdim=True)
+            value = F.interpolate(
+                value.unsqueeze(0), size=(28, 28), mode="bilinear", align_corners=False
+            ).squeeze(0)
+        return value.mul(2.0).sub(1.0)
     if kind == "channel_standardize":
         mean = value.new_tensor(transform["mean"])[:, None, None]
         std = value.new_tensor(transform["std"])[:, None, None]
@@ -214,6 +222,11 @@ def _load_set(
         root = data_root.parent if (data_root / "raw").is_dir() else data_root
         dataset = MNIST(root=str(root), train=train, download=download)
         return dataset.data.unsqueeze(1).contiguous(), dataset.targets.to(torch.long)
+    if name == "svhn":
+        from torchvision.datasets import SVHN
+
+        dataset = SVHN(root=str(data_root), split="train" if train else "test", download=download)
+        return torch.from_numpy(dataset.data.copy()), torch.tensor(dataset.labels, dtype=torch.long)
     if name in {"cifar10", "cifar100"}:
         directory = _find_cifar_python_directory(name, data_root)
         if directory is not None:

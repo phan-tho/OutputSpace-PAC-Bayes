@@ -28,11 +28,16 @@ The smoke run is the built-in certificate-critical check. It exercises the obser
 ```bash
 python run.py --preset mnist-cnn32 --data-root ./data --download --device auto --output result.json
 python run.py --preset mnist-lenet5 --data-root ./data --download --device auto --output result.json
+python run.py --preset mnist-svhn-cnn32 --data-root ./data --download --device auto --output result.json
 python run.py --preset cifar10-wrn28-4 --data-root /datasets/cifar10 --device cuda --workers 4 --output result.json
 python run.py --preset cifar100-wrn28-4 --data-root /datasets/cifar100 --device cuda --workers 4 --output result.json
 ```
 
 CIFAR data can be a torchvision download or an extracted Python-batch directory anywhere under `--data-root`.
+
+The `mnist-svhn-cnn32` transfer preset downloads both datasets with torchvision,
+trains the 32-feature MNIST CNN on grayscale/resized SVHN, removes its source
+classification head, and uses `[1, raw_features]` with zero target base scores.
 
 The transfer preset reuses the separately audited ImageNet statistic artifact:
 
