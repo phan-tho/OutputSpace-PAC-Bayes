@@ -44,6 +44,12 @@ subprocess.run([
     "git", "clone", "--quiet", "--depth", "1", "--branch", "main",
     "https://github.com/phan-tho/OutputSpace-PAC-Bayes.git", str(repo),
 ], check=True)
+subprocess.run([
+    "git", "-C", str(repo), "fetch", "--quiet", "--depth", "1", "origin", EXPECTED_COMMIT
+], check=True)
+subprocess.run([
+    "git", "-C", str(repo), "checkout", "--quiet", EXPECTED_COMMIT
+], check=True)
 commit = subprocess.check_output(
     ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
 ).strip()
