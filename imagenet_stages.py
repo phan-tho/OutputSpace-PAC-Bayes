@@ -10,7 +10,12 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from data import fit_A_only_input_transform, load_training_set, observation_independent_split
+from data import (
+    fit_A_only_input_transform,
+    load_sharded_imagenet_training_set,
+    load_training_set,
+    observation_independent_split,
+)
 from models import (
     PriorModel,
     extract_prior_outputs,
@@ -50,9 +55,16 @@ def parser() -> argparse.ArgumentParser:
 
     prepare = commands.add_parser("prepare")
     prepare.add_argument("--config", type=Path, default=HERE / "configs/imagenet-resnet18.json")
-    prepare.add_argument("--data-root", type=Path, required=True)
+    training_data = prepare.add_mutually_exclusive_group(required=True)
+    training_data.add_argument("--data-root", type=Path)
+    training_data.add_argument("--image-index", type=Path)
+    prepare.add_argument("--shard-root", type=Path)
     prepare.add_argument("--output-dir", type=Path, required=True)
-    prepare.add_argument("--prior-checkpoint", type=Path)
+    prior_input = prepare.add_mutually_exclusive_group()
+    prior_input.add_argument("--prior-checkpoint", type=Path)
+    prior_input.add_argument("--resume-training-checkpoint", type=Path)
+    prepare.add_argument("--stop-after-epoch", type=int)
+    prepare.add_argument("--save-training-checkpoints", action="store_true")
     prepare.add_argument("--seed", type=int, default=7)
     prepare.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     prepare.add_argument("--workers", type=int, default=8)
@@ -73,6 +85,11 @@ def prepare(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if config["dataset"]["name"] != "imagenet" or config["prior"]["source"] != "a_trained":
         raise ValueError("prepare requires the A-trained ImageNet configuration")
+    if args.stop_after_epoch is not None:
+        if not 1 <= args.stop_after_epoch <= config["prior"]["epochs"]:
+            raise ValueError("--stop-after-epoch must lie within the configured training schedule")
+        if args.stop_after_epoch < config["prior"]["epochs"] and not args.prior_only:
+            raise ValueError("a partial prior stage must use --prior-only")
     config["seed"] = args.seed
     config["dataset"]["split_seed"] = args.seed
 
@@ -90,9 +107,18 @@ def prepare(args: argparse.Namespace) -> None:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_images, train_labels = load_training_set(
-        config["dataset"], args.data_root.resolve(), False, args.seed
-    )
+    if args.image_index is not None:
+        if args.shard_root is None:
+            raise ValueError("--image-index requires --shard-root")
+        train_images, train_labels = load_sharded_imagenet_training_set(
+            args.image_index.resolve(), args.shard_root.resolve()
+        )
+    else:
+        if args.shard_root is not None:
+            raise ValueError("--shard-root is only used with --image-index")
+        train_images, train_labels = load_training_set(
+            config["dataset"], args.data_root.resolve(), False, args.seed
+        )
     A_indices, B_indices = observation_independent_split(
         train_labels.numel(), config["dataset"]["prior_fraction"], args.seed
     )
@@ -109,6 +135,14 @@ def prepare(args: argparse.Namespace) -> None:
         prior, train_images, train_labels, A_indices, input_transform, config["prior"],
         device, args.workers, args.seed,
         args.prior_checkpoint.resolve() if args.prior_checkpoint else None,
+        checkpoint_directory=(
+            output_dir / "checkpoints" if args.save_training_checkpoints else None
+        ),
+        resume_training_checkpoint=(
+            args.resume_training_checkpoint.resolve()
+            if args.resume_training_checkpoint else None
+        ),
+        stop_after_epoch=args.stop_after_epoch,
     )
 
     checkpoint_path = output_dir / "prior.pt"
@@ -150,29 +184,33 @@ def prepare(args: argparse.Namespace) -> None:
         prior, train_images, train_labels, local_B, input_transform,
         extraction_batch, device, args.workers, output_dtype=torch.float32,
     )
-    shard_path = output_dir / f"features-rank{rank}.pt"
-    torch.save({"raw_A": raw_A, "raw_B": raw_B, "base_B": base_B, "labels_B": labels_B}, shard_path)
-    del raw_A, raw_B, base_B, labels_B
-
     if distributed:
+        shard_path = output_dir / f"features-rank{rank}.pt"
+        torch.save(
+            {"raw_A": raw_A, "raw_B": raw_B, "base_B": base_B, "labels_B": labels_B},
+            shard_path,
+        )
+        del raw_A, raw_B, base_B, labels_B
         dist.barrier()
         dist.destroy_process_group()
-    if rank != 0:
-        return
+        if rank != 0:
+            return
+        shards = [
+            torch.load(
+                output_dir / f"features-rank{index}.pt", map_location="cpu", weights_only=True
+            )
+            for index in range(world_size)
+        ]
+        raw_A = torch.cat([shard["raw_A"] for shard in shards])
+        raw_B = torch.cat([shard["raw_B"] for shard in shards])
+        base_B = torch.cat([shard["base_B"] for shard in shards])
+        labels_B = torch.cat([shard["labels_B"] for shard in shards])
+        del shards
 
-    shards = [
-        torch.load(output_dir / f"features-rank{index}.pt", map_location="cpu", weights_only=True)
-        for index in range(world_size)
-    ]
-    raw_A = torch.cat([shard["raw_A"] for shard in shards])
     full_pca_config = dict(config["feature_map"])
     full_pca_config["rank"] = config["encoder"]["feature_dimension"] + 1
     feature_transform = fit_feature_transform(raw_A, full_pca_config)
     del raw_A
-    raw_B = torch.cat([shard["raw_B"] for shard in shards])
-    base_scores_B = torch.cat([shard["base_B"] for shard in shards])
-    labels_B = torch.cat([shard["labels_B"] for shard in shards])
-    del shards
     values_B = raw_B.to(torch.float64)
     whitened_features_B = (
         (values_B - feature_transform["mean"]) @ feature_transform["directions"]
@@ -204,7 +242,7 @@ def prepare(args: argparse.Namespace) -> None:
         "input_transform": input_transform,
         "feature_transform": feature_transform,
         "whitened_features_B": whitened_features_B.to(torch.float32),
-        "base_scores_B": base_scores_B.to(torch.float32),
+        "base_scores_B": base_B.to(torch.float32),
         "labels_B": labels_B,
         "observable_coordinates_by_rank": coordinates_by_rank,
     }, prepared_path)
@@ -231,8 +269,9 @@ def prepare(args: argparse.Namespace) -> None:
         "support_by_rank": support_by_rank,
         "prepared_artifact": str(prepared_path),
     }))
-    for index in range(world_size):
-        (output_dir / f"features-rank{index}.pt").unlink()
+    if distributed:
+        for index in range(world_size):
+            (output_dir / f"features-rank{index}.pt").unlink()
     print(f"[prepared] prior={checkpoint_path}")
     print(f"[prepared] features/PCA/support={prepared_path}")
 
@@ -259,12 +298,11 @@ def tune(args: argparse.Namespace) -> None:
     coordinates_for_rank = artifact["observable_coordinates_by_rank"].get(str(rank))
     if coordinates_for_rank is None:
         raise RuntimeError(f"prepared artifact has no observable-rank audit for rank {rank}")
-    whitened_features_B = artifact["whitened_features_B"].to(torch.float64)
     features_B = posterior_features(
-        whitened_features_B, rank, config["feature_map"]["kappa"]
-    )
-    base_scores_B = artifact["base_scores_B"].to(torch.float64)
-    labels_B = artifact["labels_B"].to(torch.long)
+        artifact.pop("whitened_features_B"), rank, config["feature_map"]["kappa"]
+    ).to(torch.float64)
+    base_scores_B = artifact.pop("base_scores_B").to(torch.float64)
+    labels_B = artifact.pop("labels_B").to(torch.long)
     coordinates = {
         "right_basis": coordinates_for_rank["right_basis"].to(torch.float64),
         "number_examples": labels_B.numel(),

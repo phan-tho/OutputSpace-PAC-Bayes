@@ -173,12 +173,29 @@ class ResNet18Backbone(nn.Module):
         return self.model(inputs)
 
 
+class ResNet50Backbone(nn.Module):
+    """Randomly initialized torchvision ResNet-50 for an A-trained prior."""
+
+    feature_dim = 2048
+
+    def __init__(self) -> None:
+        super().__init__()
+        from torchvision.models import resnet50
+
+        self.model = resnet50(weights=None)
+        self.model.fc = nn.Identity()
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.model(inputs)
+
+
 BACKBONES = {
     "mlp": MlpBackbone,
     "mnist_cnn": MnistCnnBackbone,
     "lenet5": LeNet5Backbone,
     "wrn28_4": WideResNet28x4Backbone,
     "resnet18": ResNet18Backbone,
+    "resnet50": ResNet50Backbone,
     "imagenet_resnet18": ImageNetResNet18Backbone,
 }
 
@@ -197,9 +214,9 @@ def make_backbone(
         backbone = BACKBONES[name]()
     elif name == "wrn28_4":
         backbone = BACKBONES[name](config["feature_dimension"], config["dropout"])
-    elif name == "resnet18":
+    elif name in {"resnet18", "resnet50"}:
         if weights_path is not None:
-            raise ValueError("the A-trained ResNet-18 must start from its fixed random initialization")
+            raise ValueError("an A-trained ResNet must start from its fixed random initialization")
         backbone = BACKBONES[name]()
     elif name == "imagenet_resnet18":
         backbone = BACKBONES[name](weights_path)
@@ -250,8 +267,14 @@ def train_or_load_prior(
     workers: int,
     seed: int,
     checkpoint: Path | None,
+    *,
+    checkpoint_directory: Path | None = None,
+    resume_training_checkpoint: Path | None = None,
+    stop_after_epoch: int | None = None,
 ) -> dict[str, Any]:
     model.to(device)
+    if checkpoint is not None and resume_training_checkpoint is not None:
+        raise ValueError("use either a completed prior checkpoint or a training checkpoint")
     if config["source"] in {"upstream", "random"}:
         model.freeze()
         return {
@@ -262,6 +285,7 @@ def train_or_load_prior(
 
     if A_indices.numel() == 0:
         raise ValueError("A-trained prior received an empty A block")
+    A_index_sha256 = tensor_sha256(A_indices)
     if checkpoint is not None:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if not isinstance(payload, Mapping) or not isinstance(payload.get("state_dict"), Mapping):
@@ -269,7 +293,7 @@ def train_or_load_prior(
         metadata = payload.get("metadata", {})
         if metadata.get("number_classes") != model.number_classes:
             raise RuntimeError("prior checkpoint class count does not match")
-        if metadata.get("A_index_sha256") != tensor_sha256(A_indices):
+        if metadata.get("A_index_sha256") != A_index_sha256:
             raise RuntimeError("prior checkpoint was not trained on this A split")
         model.load_state_dict(payload["state_dict"], strict=True)
         model.freeze()
@@ -300,6 +324,7 @@ def train_or_load_prior(
         ), num_workers=workers,
         pin_memory=device.type == "cuda",
         persistent_workers=workers > 0,
+        prefetch_factor=4 if workers > 0 else None,
     )
 
     training_gpu_count = dist.get_world_size() if distributed else int(device.type == "cuda")
@@ -324,11 +349,36 @@ def train_or_load_prior(
         )
         scheduler = None
 
+    end_epoch = min(config["epochs"], stop_after_epoch or config["epochs"])
+    if end_epoch <= 0:
+        raise ValueError("the final training epoch must be positive")
     best_state, best_epoch = None, 0
     best_calibration = (math.inf, math.inf)
     final_training_loss = math.nan
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
-    for epoch in range(1, config["epochs"] + 1):
+    start_epoch = 0
+    if resume_training_checkpoint is not None:
+        payload = torch.load(resume_training_checkpoint, map_location="cpu", weights_only=True)
+        metadata = payload.get("metadata", {})
+        if metadata.get("number_classes") != model.number_classes:
+            raise RuntimeError("training checkpoint class count does not match")
+        if metadata.get("A_index_sha256") != A_index_sha256:
+            raise RuntimeError("training checkpoint was not trained on this A split")
+        if metadata.get("seed") != seed:
+            raise RuntimeError("training checkpoint seed does not match")
+        start_epoch = int(metadata.get("epoch", 0))
+        if not 0 < start_epoch < end_epoch:
+            raise RuntimeError(f"cannot resume epoch {start_epoch} through epoch {end_epoch}")
+        model.load_state_dict(payload["model_state_dict"], strict=True)
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        scaler.load_state_dict(payload["scaler_state_dict"])
+        if scheduler is not None:
+            scheduler.load_state_dict(payload["scheduler_state_dict"])
+        if calibration_indices.numel():
+            raise ValueError("resumed training currently requires calibration_fraction=0")
+        print(f"[prior] resumed from {resume_training_checkpoint} at epoch {start_epoch}", flush=True)
+
+    for epoch in range(start_epoch + 1, end_epoch + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
         if config["optimizer"] == "sgd":
@@ -383,11 +433,27 @@ def train_or_load_prior(
                 best_calibration = (calibration_loss, calibration_error)
                 best_epoch = epoch
                 best_state = _cpu_state(model.state_dict())
-        elif not calibration_indices.numel() and epoch == config["epochs"]:
+        elif not calibration_indices.numel() and epoch == end_epoch:
             best_epoch = epoch
             best_state = _cpu_state(model.state_dict())
         if scheduler is not None:
             scheduler.step()
+        if checkpoint_directory is not None and (not distributed or dist.get_rank() == 0):
+            checkpoint_directory.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_state_dict": _cpu_state(model.state_dict()),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
+                "metadata": {
+                    "epoch": epoch,
+                    "target_epochs": config["epochs"],
+                    "number_classes": model.number_classes,
+                    "A_index_sha256": A_index_sha256,
+                    "seed": seed,
+                    "training_loss": final_training_loss,
+                },
+            }, checkpoint_directory / f"epoch-{epoch:03d}.pt")
 
     if best_state is None:
         raise RuntimeError("prior training selected no model state")
@@ -400,8 +466,12 @@ def train_or_load_prior(
         ),
         "final_training_loss": final_training_loss,
         "state_sha256": state_dict_sha256(model.state_dict()),
-        "checkpoint_source": None,
+        "checkpoint_source": (
+            str(resume_training_checkpoint.resolve())
+            if resume_training_checkpoint is not None else None
+        ),
         "training_gpu_count": training_gpu_count,
+        "resumed_from_epoch": start_epoch,
     }
 
 
@@ -423,6 +493,7 @@ def extract_prior_outputs(
         IndexedDataset(images, labels, indices, input_transform), batch_size=batch_size,
         shuffle=False, num_workers=workers, pin_memory=device.type == "cuda",
         persistent_workers=workers > 0,
+        prefetch_factor=4 if workers > 0 else None,
     )
     model.eval()
     feature_parts, score_parts, label_parts = [], [], []

@@ -28,6 +28,52 @@ def load_test_set(
     return _load_set(config, data_root, train=False, download=download, seed=experiment_seed)
 
 
+def load_sharded_imagenet_training_set(
+    image_index_path: Path, shard_root: Path
+) -> tuple[Any, Tensor]:
+    """Load the canonical ImageNet order from 15 mounted notebook outputs."""
+
+    class_index_path = image_index_path.with_name("class_index.csv")
+    with class_index_path.open(newline="", encoding="utf-8") as handle:
+        class_rows = list(csv.DictReader(handle))
+    if len(class_rows) != 1000:
+        raise RuntimeError(f"expected 1,000 ImageNet classes, found {len(class_rows)}")
+    class_id = {row["wnid"]: int(row["class_id"]) for row in class_rows}
+    if sorted(class_id.values()) != list(range(1000)):
+        raise RuntimeError("class_index.csv does not contain class IDs 0 through 999")
+
+    paths_by_class: dict[str, list[Path]] = {wnid: [] for wnid in class_id}
+    shard_directories: dict[int, Path] = {}
+    with image_index_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            shard_id = int(row["shard_id"])
+            wnid = row["wnid"]
+            if shard_id not in shard_directories:
+                notebook_root = shard_root / f"im-s{shard_id}"
+                candidates = (notebook_root, notebook_root / "train")
+                shard_directories[shard_id] = next(
+                    (path for path in candidates if (path / wnid).is_dir()), None
+                )
+                if shard_directories[shard_id] is None:
+                    raise FileNotFoundError(
+                        f"cannot find class {wnid} below {notebook_root} or {notebook_root / 'train'}"
+                    )
+            paths_by_class[wnid].append(
+                shard_directories[shard_id] / wnid / row["image_filename"]
+            )
+
+    if sorted(shard_directories) != list(range(15)):
+        raise RuntimeError(f"expected shard IDs 0 through 14, found {sorted(shard_directories)}")
+    paths, labels = [], []
+    for wnid, label in sorted(class_id.items(), key=lambda item: item[1]):
+        class_paths = sorted(paths_by_class[wnid])
+        paths.extend(class_paths)
+        labels.extend([label] * len(class_paths))
+    if len(paths) != 1_281_167:
+        raise RuntimeError(f"expected 1,281,167 ImageNet images, found {len(paths)}")
+    return ImageNetPaths(paths), torch.tensor(labels, dtype=torch.long)
+
+
 def observation_independent_split(
     number_examples: int, prior_fraction: float, split_seed: int
 ) -> tuple[Tensor, Tensor]:
