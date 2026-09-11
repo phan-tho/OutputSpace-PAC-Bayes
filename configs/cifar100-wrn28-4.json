@@ -2,7 +2,7 @@
   "name": "cifar100-wrn28-4",
   "dataset": {
     "name": "cifar100",
-    "prior_fraction": 0.8,
+    "prior_fraction": 0.5,
     "number_classes": 100
   },
   "encoder": {
