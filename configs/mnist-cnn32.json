@@ -2,7 +2,7 @@
   "name": "mnist-cnn32",
   "dataset": {
     "name": "mnist",
-    "prior_fraction": 0.8,
+    "prior_fraction": 0.5,
     "number_classes": 10
   },
   "encoder": {
