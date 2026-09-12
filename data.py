@@ -50,13 +50,24 @@ def load_sharded_imagenet_training_set(
             wnid = row["wnid"]
             if shard_id not in shard_directories:
                 notebook_root = shard_root / f"im-s{shard_id}"
-                candidates = (notebook_root, notebook_root / "train")
+                fallback_parent = (
+                    shard_root.with_name(shard_root.name[:-1])
+                    if shard_root.name.endswith("o")
+                    else shard_root
+                )
+                fallback_root = fallback_parent / f"im-s{shard_id}"
+                candidates = (
+                    notebook_root,
+                    notebook_root / "train",
+                    fallback_root,
+                    fallback_root / "train",
+                )
                 shard_directories[shard_id] = next(
                     (path for path in candidates if (path / wnid).is_dir()), None
                 )
                 if shard_directories[shard_id] is None:
                     raise FileNotFoundError(
-                        f"cannot find class {wnid} below {notebook_root} or {notebook_root / 'train'}"
+                        f"cannot find class {wnid} below {notebook_root} or {fallback_root}"
                     )
             paths_by_class[wnid].append(
                 shard_directories[shard_id] / wnid / row["image_filename"]
